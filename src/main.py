@@ -50,7 +50,7 @@ def get_database_connection():
 
         if domain: conn_str_parts.append(f"UID={domain}\\{user}")
         else: conn_str_parts.append(f"UID={user}")
-        
+
         conn_str_parts.append(f"PWD={password}")
 
         connection_string = ";".join(conn_str_parts)
@@ -105,15 +105,18 @@ def sync_products():
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
     """
     try:
-        # Przykładowe zapytanie do bazy danych
-        cursor.execute("SELECT Twr_Nazwa, Twr_Opis, Twr_CenaZCzteremaMiejscami FROM CDN.Towary")
+        cursor.execute('''
+                       SELECT DISTINCT Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie FROM CDN.Towary t
+                       INNER JOIN CDN.TwrCeny tc ON t.Twr_TwrId = tc.TwC_TwrID
+                       WHERE tc.TwC_Typ = 2
+                       ''')
         products = cursor.fetchall()
 
         for product in products:
             data = {
-                "name": product[0],
-                "description": product[1],
-                "regular_price": str(product[2])
+                "name": product.Twr_Nazwa,
+                "description": product.Twr_Opis,
+                "regular_price": str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
             }
             try:
                 log.debug(f"Produkt: {data}")
