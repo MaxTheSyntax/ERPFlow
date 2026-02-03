@@ -4,6 +4,7 @@ from requests.exceptions import HTTPError
 import logging
 from dotenv import load_dotenv
 import os
+import argparse
 
 # Konfiguracja logowania
 from logging_formatter import CustomFormatter
@@ -20,6 +21,7 @@ load_dotenv()
 # Zmienne globalne
 cursor = None
 wcapi = None
+args = None
 
 __conn = None
 __cursor = None
@@ -88,6 +90,20 @@ def get_woocommerce_api():
         raise
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Synchronizacja produktów między bazą danych MSSQL a WooCommerce."
+    )
+    parser.add_argument(
+        "--obejmuj-darmowe-towary",
+        dest="obejmuj_darmowe_towary",
+        action="store_true",
+        default=False,
+        help="Synchronizuj również darmowe towary (cena = 0). Domyślnie wyłączone."
+    )
+    
+    global args
+    args = parser.parse_args()
+    
     # Połączenie z bazą danych i WooCommerce API
     global cursor, wcapi
     try:
@@ -105,11 +121,18 @@ def sync_products():
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
     """
     try:
-        cursor.execute('''
-                       SELECT DISTINCT Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie FROM CDN.Towary t
-                       INNER JOIN CDN.TwrCeny tc ON t.Twr_TwrId = tc.TwC_TwrID
-                       WHERE tc.TwC_Typ = 2
-                       ''')
+        # Jeśli flaga --obejmuj-darmowe-towary nie jest ustawiona, pomijamy towary z ceną 0
+        # price_condition = ""
+        # if not args.obejmuj_darmowe_towary:
+        #     price_condition = "AND tc.TwC_Wartosc > 0"
+        
+        query = f'''
+            SELECT DISTINCT Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie FROM CDN.Towary t
+            INNER JOIN CDN.TwrCeny tc ON t.Twr_TwrId = tc.TwC_TwrID
+            WHERE tc.TwC_Typ = 2
+        '''
+        
+        cursor.execute(query)
         products = cursor.fetchall()
 
         for product in products:
@@ -121,12 +144,16 @@ def sync_products():
             try:
                 log.debug(f"Produkt: {data}")
 
-                # response = wcapi.post("products", data).json()
-                # if not response.get("id"):
-                #     log.error(f"Błąd podczas synchronizacji produktu {product[0]}: {response}")
-                #     continue
+                if float(data["regular_price"]) == 0 and not args.obejmuj_darmowe_towary:
+                    log.warning(f"Pominięto darmowy produkt '{product[0]}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
+                    continue
 
-                log.info(f"Produkt {product[0]} zsynchronizowany z WooCommerce.")
+                response = wcapi.post("products", data).json()
+                if not response.get("id"):
+                    log.error(f"Błąd podczas synchronizacji produktu {product[0]}: {response}")
+                    continue
+
+                log.info(f"Produkt '{product[0]}' zsynchronizowany z WooCommerce.")
             except HTTPError as http_err:
                 log.error(f"Błąd HTTP podczas synchronizacji produktu {product[0]}: {http_err}")
         log.info("Zakończono synchronizacje produktów.")
