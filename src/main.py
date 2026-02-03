@@ -121,12 +121,7 @@ def sync_products():
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
     """
     try:
-        # Jeśli flaga --obejmuj-darmowe-towary nie jest ustawiona, pomijamy towary z ceną 0
-        # price_condition = ""
-        # if not args.obejmuj_darmowe_towary:
-        #     price_condition = "AND tc.TwC_Wartosc > 0"
-        
-        query = f'''
+        query = '''
             SELECT DISTINCT Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie FROM CDN.Towary t
             INNER JOIN CDN.TwrCeny tc ON t.Twr_TwrId = tc.TwC_TwrID
             WHERE tc.TwC_Typ = 2
@@ -135,31 +130,58 @@ def sync_products():
         cursor.execute(query)
         products = cursor.fetchall()
 
+        products_to_create = []        
         for product in products:
-            data = {
+            regular_price = str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
+            
+            # Pomijamy darmowe towary jeśli flaga nie jest ustawiona
+            if float(regular_price) == 0 and not args.obejmuj_darmowe_towary:
+                log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
+                continue
+            
+            product_data = {
                 "name": product.Twr_Nazwa,
                 "description": product.Twr_Opis,
-                "regular_price": str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
+                "regular_price": regular_price
             }
+            products_to_create.append(product_data)
+            log.debug(f"Przygotowano produkt do synchronizacji: {product_data}")
+
+        # WooCommerce ma limit 100 produktów na żądanie
+        batch_size = 100
+        total_synced = 0
+        
+        for i in range(0, len(products_to_create), batch_size):
+            batch = products_to_create[i:i + batch_size]
+            
+            data = {
+                "create": batch
+            }
+            
             try:
-                log.debug(f"Produkt: {data}")
-
-                if float(data["regular_price"]) == 0 and not args.obejmuj_darmowe_towary:
-                    log.warning(f"Pominięto darmowy produkt '{product[0]}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
-                    continue
-
-                response = wcapi.post("products", data).json()
-                if not response.get("id"):
-                    log.error(f"Błąd podczas synchronizacji produktu {product[0]}: {response}")
-                    continue
-
-                log.info(f"Produkt '{product[0]}' zsynchronizowany z WooCommerce.")
+                response = wcapi.post("products/batch", data).json()
+                
+                # Sprawdzenie wyników
+                created = response.get("create", [])
+                errors = [item for item in created if item.get("error")]
+                successful = [item for item in created if not item.get("error") and item.get("id")]
+                
+                total_synced += len(successful)
+                
+                for item in successful:
+                    log.info(f"Produkt '{item.get('name', 'N/A')}' zsynchronizowany z WooCommerce (ID: {item.get('id')}).")
+                
+                for error in errors:
+                    log.error(f"Błąd podczas synchronizacji produktu: {error}")
+                    
             except HTTPError as http_err:
-                log.error(f"Błąd HTTP podczas synchronizacji produktu {product[0]}: {http_err}")
-        log.info("Zakończono synchronizacje produktów.")
+                log.error(f"Błąd HTTP podczas synchronizacji partii produktów: {http_err}")
+            except Exception as e:
+                log.error(f"Błąd podczas synchronizacji partii produktów: {e}")
+        
+        log.info(f"Zakończono synchronizacje produktów. Zsynchronizowano {total_synced}/{len(products_to_create)} produktów.")
     except Exception as e:
         log.error(f"Błąd podczas synchronizacji produktów: {e}")
-        raise
     
     
 if __name__ == "__main__":
