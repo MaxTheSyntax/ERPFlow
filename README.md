@@ -1,0 +1,1 @@
+Uwaga: upwenij się że masz zainstalowane `unixodbc`
