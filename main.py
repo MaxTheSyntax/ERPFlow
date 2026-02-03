@@ -2,10 +2,16 @@ import pyodbc
 from woocommerce import API
 from requests.exceptions import HTTPError
 import logging
+from dotenv import load_dotenv
+import os
 
 # Konfiguracja logowania
 logging.basicConfig(level=logging.INFO)
 
+# env
+load_dotenv()
+
+# Zmienne globalne
 cursor = None
 wcapi = None
 
@@ -22,12 +28,13 @@ def get_database_connection():
     try:
         cnxn = pyodbc.connect(
             'DRIVER={ODBC Driver 17 for SQL Server};'
-            'SERVER=your_server;'
-            'DATABASE=your_database;'
-            'UID=your_username;'
-            'PWD=your_password'
+            f'SERVER={os.getenv("DATABASE_HOST")};'
+            f'DATABASE={os.getenv("DATABASE_NAME")};'
+            f'UID={os.getenv("DATABASE_USER")};'
+            f'PWD={os.getenv("DATABASE_PASSWORD")};'
         )
         __cursor = cnxn.cursor()
+        __cursor.execute("ALTER USER CURRENT_USER WITH DEFAULT_SCHEMA = CDN")
         logging.info("Połączono z bazą danych MSSQL.")
         return __cursor
     except Exception as e:
@@ -46,9 +53,9 @@ def get_woocommerce_api():
         return __wcapi
     try:
         __wcapi = API(
-            url="https://your-store.com",
-            consumer_key="your_consumer_key",
-            consumer_secret="your_consumer_secret",
+            url=os.getenv("WOOCOMMERCE_STORE_URL"),
+            consumer_key=os.getenv("WOOCOMMERCE_CONSUMER_KEY"),
+            consumer_secret=os.getenv("WOOCOMMERCE_CONSUMER_SECRET"),
             version="wc/v3"
         )
         logging.info("Połączono z WooCommerce API.")
@@ -90,9 +97,6 @@ def sync_products():
             except HTTPError as http_err:
                 logging.error(f"Błąd HTTP podczas synchronizacji produktu {product.Twr_Nazwa}: {http_err}")
         logging.info("Zakończono synchronizacje produktów.")
-    except HTTPError as http_err:
-        logging.error(f"Błąd HTTP podczas synchronizacji produktów: {http_err}")
-        raise
     except Exception as e:
         logging.error(f"Błąd podczas synchronizacji produktów: {e}")
         raise
