@@ -22,6 +22,7 @@ load_dotenv()
 cursor = None
 wcapi = None
 args = None
+conn = None
 
 __conn = None
 __cursor = None
@@ -54,13 +55,14 @@ def get_database_connection():
         else: conn_str_parts.append(f"UID={user}")
 
         conn_str_parts.append(f"PWD={password}")
+        log.debug(f"Używamy: {conn_str_parts}")
 
         connection_string = ";".join(conn_str_parts)
 
         __conn = pyodbc.connect(connection_string)
         __cursor = __conn.cursor()
         log.info("Połączono z bazą danych MSSQL (pyodbc).")
-        return __cursor
+        return __cursor, __conn
     except Exception as e:
         log.error(f"Błąd połączenia z bazą danych: {e}")
         raise
@@ -100,21 +102,77 @@ def main():
         default=False,
         help="Synchronizuj również darmowe towary (cena = 0). Domyślnie wyłączone."
     )
+    parser.add_argument(
+        "--setup",
+        dest="setup",
+        action="store_true",
+        default=False,
+        help="Skonfiguruj bazę danych do śledzenia zmian."
+    )
     
     global args
     args = parser.parse_args()
     
     # Połączenie z bazą danych i WooCommerce API
-    global cursor, wcapi
+    global cursor, conn, wcapi
     try:
-        cursor = get_database_connection()
+        cursor, conn = get_database_connection()
         wcapi = get_woocommerce_api()
     except Exception as e:
         log.error(f"Błąd podczas łączenia się z zasobami: {e}")
         raise
 
+    # Konfiguracja bazy danych do śledzenia zmian jeśli flaga jest ustawiona
+    if args.setup:
+        setup()
+        return
+
     # Synchronizacja produktów
     sync_products()
+
+def is_already_enabled_error(error):
+    """
+    Sprawdza czy błąd oznacza że change tracking jest już włączone.
+    """
+    msg = str(error).lower()
+    return "change tracking" in msg and ("already enabled" in msg or "already been enabled" in msg)
+
+def setup():
+    """
+    Konfigugurje baze danych do synchronizacji.
+    Obsługuje przypadki częściowego włączenia śledzenia zmian.
+    """
+    database_name = os.getenv("database_name")
+    tracked_tables = ["Towary", "TwrCeny"]
+    
+    try:
+        # Włączenie change tracking nie działa z fiskalizacją, więc włączamy autocommit.
+        conn.autocommit = True
+        try:
+            cursor.execute(f'''ALTER DATABASE [{database_name}] SET CHANGE_TRACKING = ON (AUTO_CLEANUP = ON, CHANGE_RETENTION = 2 DAYS);''')
+            log.debug(f"Śledzenie zmian włączone dla bazy danych '{database_name}'.")
+        except pyodbc.Error as db_error:
+            if is_already_enabled_error(db_error):
+                log.warning(f"Śledzenie zmian jest już włączone dla bazy danych '{database_name}'.")
+            else:
+                raise
+        
+        # Włącz śledzenie zmian dla każdej tabeli osobno używając w pełni kwalifikowanych nazw
+        for table in tracked_tables:
+            try:
+                cursor.execute(f'''ALTER TABLE [{database_name}].[CDN].[{table}] ENABLE CHANGE_TRACKING;''')
+                log.debug(f"Włączono śledzenie zmian dla tabeli '{table}'.")
+            except pyodbc.Error as table_error:
+                if is_already_enabled_error(table_error):
+                    log.warning(f"Śledzenie zmian jest już włączone dla tabeli '{table}'.")
+                else:
+                    raise
+
+        conn.autocommit = False
+        log.info("Konfiguracja śledzenia zmian zakończona pomyślnie.")
+    except pyodbc.Error as e:
+        log.error(f"Błąd podczas konfiguracji bazy danych do śledzenia zmian: {e}")
+        raise
 
 def sync_products():
     """
