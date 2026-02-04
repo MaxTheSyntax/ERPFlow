@@ -12,6 +12,8 @@ python src/main.py [opcje]
 ### Opcje
 
 - `--obejmuj-darmowe-towary` - Synchronizuj również darmowe towary (cena = 0). Domyślnie wyłączone.
+- `--setup` - Inicjalizuje śledzenie zmian w bazie danych. Należy uruchomić przed pierwszą synchronizacją.
+- `--odtworz` - Tworzy wszystkie elementy bez względu na istniejące dane.
 
 # Instalacja
 

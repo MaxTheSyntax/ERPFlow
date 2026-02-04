@@ -1,3 +1,4 @@
+import time
 import pyodbc
 from woocommerce import API
 from requests.exceptions import HTTPError
@@ -5,6 +6,10 @@ import logging
 from dotenv import load_dotenv
 import os
 import argparse
+import json
+
+# Ścieżka do pliku JSON przechowującego wersje śledzenia zmian
+CHANGE_TRACKING_FILE = os.path.join(os.path.dirname(__file__), "change_tracking_versions.json")
 
 # Konfiguracja logowania
 from logging_formatter import CustomFormatter
@@ -23,6 +28,9 @@ cursor = None
 wcapi = None
 args = None
 conn = None
+
+# Słownik przechowujący wersje śledzenia zmian (ładowany/zapisywany do JSON)
+change_tracking_versions = {}
 
 __conn = None
 __cursor = None
@@ -55,11 +63,11 @@ def get_database_connection():
         else: conn_str_parts.append(f"UID={user}")
 
         conn_str_parts.append(f"PWD={password}")
-        log.debug(f"Używamy: {conn_str_parts}")
 
         connection_string = ";".join(conn_str_parts)
 
         __conn = pyodbc.connect(connection_string)
+        __conn.autocommit = True
         __cursor = __conn.cursor()
         log.info("Połączono z bazą danych MSSQL (pyodbc).")
         return __cursor, __conn
@@ -109,9 +117,19 @@ def main():
         default=False,
         help="Skonfiguruj bazę danych do śledzenia zmian."
     )
+    parser.add_argument(
+        "--odtworz",
+        dest="full_rebuild",
+        action="store_true",
+        default=False,
+        help="Tworzy wszystkie elementy bez względu na istniejące dane."
+    )
     
     global args
     args = parser.parse_args()
+    
+    # Wczytanie wersji śledzenia zmian
+    load_change_tracking_versions()
     
     # Połączenie z bazą danych i WooCommerce API
     global cursor, conn, wcapi
@@ -128,7 +146,10 @@ def main():
         return
 
     # Synchronizacja produktów
-    sync_products()
+    success = sync_products()
+    
+    # Zapisanie zaktualizowanych wersji śledzenia zmian
+    if success: save_change_tracking_versions()
 
 def is_already_enabled_error(error):
     """
@@ -137,17 +158,90 @@ def is_already_enabled_error(error):
     msg = str(error).lower()
     return "change tracking" in msg and ("already enabled" in msg or "already been enabled" in msg)
 
+def load_change_tracking_versions():
+    """
+    Wczytuje wersje śledzenia zmian z pliku JSON.
+    """
+    global change_tracking_versions
+    if os.path.exists(CHANGE_TRACKING_FILE):
+        try:
+            with open(CHANGE_TRACKING_FILE, 'r', encoding='utf-8') as f:
+                change_tracking_versions = json.load(f)
+            log.debug(f"Wczytano wersje śledzenia zmian z {CHANGE_TRACKING_FILE}")
+        except (json.JSONDecodeError, IOError) as e:
+            log.warning(f"Nie udało się wczytać wersji śledzenia zmian: {e}. Tworzenie nowego pliku.")
+            change_tracking_versions = {}
+    else:
+        change_tracking_versions = {}
+        log.debug(f"Plik {CHANGE_TRACKING_FILE} nie istnieje. Tworzenie nowego.")
+
+
+def save_change_tracking_versions():
+    """
+    Zapisuje wersje śledzenia zmian do pliku JSON.
+    """
+    try:
+        with open(CHANGE_TRACKING_FILE, 'w', encoding='utf-8') as f:
+            json.dump(change_tracking_versions, f, indent=2, ensure_ascii=False)
+        log.debug(f"Zapisano wersje śledzenia zmian do {CHANGE_TRACKING_FILE}")
+    except IOError as e:
+        log.error(f"Nie udało się zapisać wersji śledzenia zmian: {e}")
+
+
+def get_current_change_tracking_version(table_key: str) -> int | None:
+    """
+    Pobiera aktualną wersję śledzenia zmian dla danej tabeli z bazy danych.
+    
+    Args:
+        table_key: Klucz tabeli w formacie "[db].[schema].[table]"
+        
+    Returns:
+        Aktualna wersja CHANGE_TRACKING_CURRENT_VERSION() lub None w przypadku błędu
+    """
+    database_name = os.getenv("database_name")
+    try:
+        # Pobieramy aktualną wersję z bazy (jest to jedna wartość na całą bazę danych)
+        cursor.execute('''SELECT CHANGE_TRACKING_CURRENT_VERSION()''')
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+    except pyodbc.Error as e:
+        log.error(f"Błąd podczas pobierania wersji śledzenia zmian dla {table_key}: {e}")
+    return None
+
 def setup():
     """
     Konfigugurje baze danych do synchronizacji.
     Obsługuje przypadki częściowego włączenia śledzenia zmian.
+    Tworzy schemat ERPFlow i tabelę WoocommerceIDs jeśli nie istnieją.
     """
     database_name = os.getenv("database_name")
     tracked_tables = ["Towary", "TwrCeny"]
     
     try:
-        # Włączenie change tracking nie działa z fiskalizacją, więc włączamy autocommit.
-        conn.autocommit = True
+        # Utworzenie schematu ERPFlow jeśli nie istnieje
+        try:
+            cursor.execute(f'''IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ERPFlow') EXEC('CREATE SCHEMA ERPFlow');''')
+            log.debug(f"Utworzono lub schemat 'ERPFlow' już istnieje.")
+        except pyodbc.Error as schema_error:
+            log.warning(f"Nie udało się utworzyć schematu 'ERPFlow': {schema_error}")
+            raise
+        
+        # Utworzenie tabeli WoocommerceIDs jeśli nie istnieje
+        try:
+            cursor.execute(f'''
+                IF NOT EXISTS (SELECT 1 FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE s.name = 'ERPFlow' AND t.name = 'WoocommerceIDs')
+                CREATE TABLE [ERPFlow].[WoocommerceIDs] (
+                    Twr_TwrId INT NOT NULL UNIQUE,
+                    WC_ID INT NOT NULL PRIMARY KEY,
+                    CONSTRAINT FK_WoocommerceIDs_Towary FOREIGN KEY (Twr_TwrId) REFERENCES CDN.Towary(Twr_TwrId)
+                );
+            ''')
+            log.debug(f"Utworzono lub tabela 'WoocommerceIDs' już istnieje.")
+        except pyodbc.Error as table_error:
+            log.warning(f"Nie udało się utworzyć tabeli 'WoocommerceIDs': {table_error}")
+            raise
+        
         try:
             cursor.execute(f'''ALTER DATABASE [{database_name}] SET CHANGE_TRACKING = ON (AUTO_CLEANUP = ON, CHANGE_RETENTION = 2 DAYS);''')
             log.debug(f"Śledzenie zmian włączone dla bazy danych '{database_name}'.")
@@ -167,28 +261,76 @@ def setup():
                     log.warning(f"Śledzenie zmian jest już włączone dla tabeli '{table}'.")
                 else:
                     raise
-
-        conn.autocommit = False
-        log.info("Konfiguracja śledzenia zmian zakończona pomyślnie.")
+        log.info("Konfiguracja bazy danych zakończona pomyślnie.")
     except pyodbc.Error as e:
-        log.error(f"Błąd podczas konfiguracji bazy danych do śledzenia zmian: {e}")
+        log.error(f"Błąd podczas konfiguracji bazy danych: {e}")
         raise
 
-def sync_products():
+def sync_products() -> bool:
     """
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
+    Używa Change Tracking do synchronizacji tylko zmienionych rekordów.
+    Returns:
+        bool: True jeśli synchronizacja zakończyła się sukcesem, False w przeciwnym razie.
     """
+    database_name = os.getenv("database_name")
+    tables = [f"[{database_name}].[CDN].[Towary]", f"[{database_name}].[CDN].[TwrCeny]"]
+    status = True
+    
+    # Pobieramy aktualne wersje dla tabel (przed synchronizacją)
+    current_versions = {}
+    for table_key in tables:
+        version = get_current_change_tracking_version(table_key)
+        if version is None:
+            log.error(f"Nie udało się pobrać wersji śledzenia zmian dla {table_key}. Przerywanie synchronizacji.")
+            return False
+        current_versions[table_key] = version
+        last_sync_version = change_tracking_versions.get(table_key, 0)
+        log.debug(f"Tabela {table_key}: ostatnia wersja = {last_sync_version}, aktualna = {version}")
+    
     try:
-        query = '''
-            SELECT DISTINCT Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie FROM CDN.Towary t
-            INNER JOIN CDN.TwrCeny tc ON t.Twr_TwrId = tc.TwC_TwrID
-            WHERE tc.TwC_Typ = 2
-        '''
+        # Jeśli mamy zapisaną wersję, używamy CHANGETABLE do pobrania tylko zmian
+        # W przeciwnym razie (pierwsza synchronizacja) pobieramy wszystko
+        has_previous_sync = all(
+            change_tracking_versions.get(table_key) is not None 
+            for table_key in tables
+        )
         
-        cursor.execute(query)
+        if has_previous_sync and not args.full_rebuild:
+            # Synchronizacja przyrostowa - tylko zmienione rekordy
+            log.info("Wykryto poprzednią synchronizację. Używanie Change Tracking dla synchronizacji przyrostowej.")
+            last_version = min(change_tracking_versions.get(table_key, 0) for table_key in tables)
+            
+            query = f'''
+                SELECT DISTINCT GREATEST(ct_t.SYS_CHANGE_VERSION, ct_tc.SYS_CHANGE_VERSION) AS SYS_CHANGE_VERSION,
+                                t.Twr_TwrId,
+                                t.Twr_Nazwa,
+                                t.Twr_Opis,
+                                tc.TwC_Wartosc,
+                                tc.TwC_Zaokraglenie
+                FROM [{database_name}].[CDN].[Towary] t
+                INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
+                LEFT JOIN CHANGETABLE(CHANGES [{database_name}].[CDN].[Towary], {last_version}) ct_t ON t.Twr_TwrId = ct_t.Twr_TwrId
+                LEFT JOIN CHANGETABLE(CHANGES [{database_name}].[CDN].[TwrCeny], {last_version}) ct_tc ON tc.TwC_TwrID = ct_tc.TwC_TwCID
+                WHERE tc.TwC_Typ = 2
+                AND (ct_t.SYS_CHANGE_VERSION IS NOT NULL
+                    OR ct_tc.SYS_CHANGE_VERSION IS NOT NULL)
+            '''
+            cursor.execute(query)
+        else:
+            # Pełna synchronizacja - wszystkie rekordy
+            log.info("Brak poprzedniej synchronizacji. Pobieranie wszystkich produktów.")
+            query = f'''
+                SELECT DISTINCT t.Twr_TwrId, Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie 
+                FROM [{database_name}].[CDN].[Towary] t
+                INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
+                WHERE tc.TwC_Typ = 2
+            '''
+            cursor.execute(query)
+        
         products = cursor.fetchall()
 
-        products_to_create = []        
+        products_to_create = {}        
         for product in products:
             regular_price = str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
             
@@ -202,15 +344,16 @@ def sync_products():
                 "description": product.Twr_Opis,
                 "regular_price": regular_price
             }
-            products_to_create.append(product_data)
+            products_to_create[product.Twr_TwrId] = product_data
             log.debug(f"Przygotowano produkt do synchronizacji: {product_data}")
 
         # WooCommerce ma limit 100 produktów na żądanie
         batch_size = 100
         total_synced = 0
         
-        for i in range(0, len(products_to_create), batch_size):
-            batch = products_to_create[i:i + batch_size]
+        products_list = list(products_to_create.values())
+        for i in range(0, len(products_list), batch_size):
+            batch = products_list[i:i + batch_size]
             
             data = {
                 "create": batch
@@ -218,28 +361,47 @@ def sync_products():
             
             try:
                 response = wcapi.post("products/batch", data).json()
-                
-                # Sprawdzenie wyników
                 created = response.get("create", [])
-                errors = [item for item in created if item.get("error")]
-                successful = [item for item in created if not item.get("error") and item.get("id")]
                 
-                total_synced += len(successful)
-                
-                for item in successful:
-                    log.info(f"Produkt '{item.get('name', 'N/A')}' zsynchronizowany z WooCommerce (ID: {item.get('id')}).")
-                
-                for error in errors:
-                    log.error(f"Błąd podczas synchronizacji produktu: {error}")
+                total_synced = 0
+                for idx, item in enumerate(created):
+                    if item.get("error"):
+                        log.error(f"Błąd podczas synchronizacji produktu '{item.get('name', 'N/A')}': {item.get('error')}")
+                        status = False
+                    elif item.get("id"):
+                        product_data_index = i + idx  # Indeks w oryginalnej liście produktów
+                        comarch_id = list(products_to_create.keys())[product_data_index]
+                        cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
+                            USING (VALUES ({comarch_id}, {item.get("id")})) AS source (Twr_TwrId, WC_ID)
+                            ON target.Twr_TwrId = source.Twr_TwrId OR target.WC_ID = source.WC_ID
+                            WHEN MATCHED THEN
+                                UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
+                            WHEN NOT MATCHED THEN
+                                INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
+
+                        total_synced += 1
+                        log.info(f"Produkt '{item.get('name', 'N/A')}' zsynchronizowany z WooCommerce (ID: {item.get('id')}).")
                     
             except HTTPError as http_err:
                 log.error(f"Błąd HTTP podczas synchronizacji partii produktów: {http_err}")
+                return False
             except Exception as e:
                 log.error(f"Błąd podczas synchronizacji partii produktów: {e}")
+                return False
+
+            time.sleep(1)  # Krótkie opóźnienie między partiami aby uniknąć limitów API
         
         log.info(f"Zakończono synchronizacje produktów. Zsynchronizowano {total_synced}/{len(products_to_create)} produktów.")
+        
+        # Aktualizujemy wersje śledzenia zmian po udanej synchronizacji
+        for table_key, version in current_versions.items():
+            change_tracking_versions[table_key] = version
+            log.debug(f"Zaktualizowano wersję śledzenia zmian dla {table_key}: {version}")
+            
     except Exception as e:
-        log.error(f"Błąd podczas synchronizacji produktów: {e}")
+        log.error(f"Błąd podczas synchronizacji produktów: {e}", stack_info=True)
+        status = False
+    return status
     
     
 if __name__ == "__main__":
