@@ -46,23 +46,28 @@ def get_database_connection():
     try:
         log.debug(f"Łączenie z bazą danych MSSQL na hoście {os.getenv('database_host')}")
         
-        host = os.getenv('database_host')  # e.g., 192.168.179.150\OPTIMA
+        host = os.getenv('database_host') 
         database = os.getenv('database_name')
         user = os.getenv('database_user')
         password = os.getenv('database_password')
-        domain = os.getenv('database_domain', '')
+        domain = os.getenv('database_domain')
+        driver = os.getenv('database_driver', '{ODBC Driver 17 for SQL Server}')
 
         conn_str_parts = [
-            "DRIVER=/usr/lib/libtdsodbc.so",
+            f"DRIVER={driver}",
             f"SERVER={host}",
             f"DATABASE={database}",
             "TrustServerCertificate=yes",
         ]
 
-        if domain: conn_str_parts.append(f"UID={domain}\\{user}")
-        else: conn_str_parts.append(f"UID={user}")
-
-        conn_str_parts.append(f"PWD={password}")
+        if user and password:
+            # SQL auth
+            if domain: conn_str_parts.append(f"UID={domain}\\{user}")
+            else: conn_str_parts.append(f"UID={user}")
+            conn_str_parts.append(f"PWD={password}")
+        else:
+            # Windows auth
+            conn_str_parts.append("Trusted_Connection=yes")
 
         connection_string = ";".join(conn_str_parts)
 
@@ -342,7 +347,8 @@ def sync_products() -> bool:
             product_data = {
                 "name": product.Twr_Nazwa,
                 "description": product.Twr_Opis,
-                "regular_price": regular_price
+                "regular_price": regular_price,
+                "sku": product.Twr_TwrId,
             }
             products_to_create[product.Twr_TwrId] = product_data
             log.debug(f"Przygotowano produkt do synchronizacji: {product_data}")
