@@ -129,6 +129,13 @@ def main():
         default=False,
         help="Tworzy wszystkie elementy bez względu na istniejące dane."
     )
+    parser.add_argument(
+        "--regeneruj",
+        dest="regeneruj",
+        action="store_true",
+        default=False,
+        help="Usuwa wszystkie produkty z WooCommerce, resetuje wersję śledzenia i synchronizuje ponownie."
+    )
     
     global args
     args = parser.parse_args()
@@ -148,6 +155,11 @@ def main():
     # Konfiguracja bazy danych do śledzenia zmian jeśli flaga jest ustawiona
     if args.setup:
         setup()
+        return
+    
+    # Regeneracja - usuwa wszystkie produkty z WooCommerce i synchronizuje ponownie
+    if args.regeneruj:
+        regenerate()
         return
 
     # Synchronizacja produktów
@@ -270,6 +282,82 @@ def setup():
     except pyodbc.Error as e:
         log.error(f"Błąd podczas konfiguracji bazy danych: {e}")
         raise
+
+def regenerate():
+    """
+    Usuwa wszystkie produkty z WooCommerce, które mają swoje ID w tabeli WoocommerceIDs,
+    resetuje wersję śledzenia zmian do 0 i uruchamia synchronizację.
+    """
+    global change_tracking_versions
+    
+    log.info("Rozpoczynanie regeneracji produktów...")
+    
+    try:
+        # Pobieramy wszystkie ID produktów WooCommerce z tabeli WoocommerceIDs
+        cursor.execute('SELECT WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+        wc_ids = [row[0] for row in cursor.fetchall()]
+        
+        if wc_ids:
+            log.info(f"Znaleziono {len(wc_ids)} produktów do usunięcia z WooCommerce.")
+            
+            # WooCommerce ma limit 100 produktów na żądanie batch
+            batch_size = 100
+            for i in range(0, len(wc_ids), batch_size):
+                batch = wc_ids[i:i + batch_size]
+                
+                data = {
+                    "delete": batch
+                }
+                
+                try:
+                    response = wcapi.post("products/batch", data).json()
+                    deleted = response.get("delete", [])
+                    
+                    for item in deleted:
+                        if item.get("error"):
+                            log.error(f"Błąd podczas usuwania produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
+                        else:
+                            log.info(f"Usunięto produkt z WooCommerce (ID: {item.get('id')}).")
+                    
+                    time.sleep(1)  # Krótkie opóźnienie między partiami
+                    
+                except HTTPError as http_err:
+                    log.error(f"Błąd HTTP podczas usuwania partii produktów: {http_err}")
+                except Exception as e:
+                    log.error(f"Błąd podczas usuwania partii produktów: {e}")
+            
+            # Czyścimy tabelę WoocommerceIDs
+            cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
+            log.info("Wyczyszczono tabelę WoocommerceIDs.")
+        else:
+            log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
+        
+        # Resetujemy wersję śledzenia zmian do 0
+        database_name = os.getenv("database_name")
+        tables = [f"[{database_name}].[CDN].[Towary]", f"[{database_name}].[CDN].[TwrCeny]"]
+        
+        for table_key in tables:
+            change_tracking_versions[table_key] = 0
+            log.debug(f"Zresetowano wersję śledzenia zmian dla {table_key} do 0.")
+        
+        # Zapisujemy zresetowane wersje
+        save_change_tracking_versions()
+        log.info("Zresetowano wersje śledzenia zmian do 0.")
+        
+        # Uruchamiamy synchronizację
+        log.info("Rozpoczynanie synchronizacji produktów...")
+        success = sync_products()
+        
+        # Zapisujemy zaktualizowane wersje śledzenia zmian
+        if success:
+            save_change_tracking_versions()
+            log.info("Regeneracja zakończona pomyślnie.")
+        else:
+            log.error("Regeneracja zakończona z błędami.")
+            
+    except Exception as e:
+        log.error(f"Błąd podczas regeneracji: {e}", stack_info=True)
+
 
 def sync_products() -> bool:
     """
