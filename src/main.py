@@ -474,7 +474,6 @@ def regenerate():
 def sync_products() -> bool:
     """
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
-    Używa Change Tracking do synchronizacji tylko zmienionych rekordów.
     Returns:
         bool: True jeśli synchronizacja zakończyła się sukcesem, False w przeciwnym razie.
     """
@@ -497,14 +496,14 @@ def sync_products() -> bool:
         # Jeśli mamy zapisaną wersję, używamy CHANGETABLE do pobrania tylko zmian
         # W przeciwnym razie (pierwsza synchronizacja) pobieramy wszystko
         has_previous_sync = all(
-            change_tracking_versions.get(table_key) not in (None, 0)
+            change_tracking_versions.get(table_key) is not None
             for table_key in tables
         )
         
         if has_previous_sync and not args.full_rebuild:
-            # Synchronizacja przyrostowa - tylko zmienione rekordy
-            log.debug("Wykryto poprzednią synchronizację.")
             last_version = min(change_tracking_versions.get(table_key, 0) for table_key in tables)
+            # Synchronizacja z użyciem CHANGETABLE
+            log.debug("Wykryto poprzednią synchronizację.")
             
             query = f'''
                 SELECT DISTINCT GREATEST(ct_t.SYS_CHANGE_VERSION, ct_tc.SYS_CHANGE_VERSION) AS SYS_CHANGE_VERSION,
@@ -535,7 +534,19 @@ def sync_products() -> bool:
         
         products = cursor.fetchall()
 
-        products_to_create = {}        
+        # Sprawdzamy czy jest coś do synchronizacji
+        if not products:
+            log.info("Brak nowych lub zmienionych produktów do synchronizacji.")
+            return True
+
+        # Pobieramy mapowanie Comarch ID -> WooCommerce ID
+        cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+        wc_id_map = {row[0]: row[1] for row in cursor.fetchall()}
+        log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań produktów.")
+
+        products_to_create = []
+        products_to_update = []
+        
         for product in products:
             regular_price = str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
             
@@ -550,30 +561,48 @@ def sync_products() -> bool:
                 "regular_price": regular_price,
                 "sku": product.Twr_TwrId,
             }
-            products_to_create[product.Twr_TwrId] = product_data
-            log.debug(f"Przygotowano produkt do synchronizacji: {product_data}")
+            
+            # Sprawdzamy czy produkt już istnieje w WooCommerce
+            if product.Twr_TwrId in wc_id_map:
+                # Produkt istnieje - dodajemy ID do aktualizacji
+                product_data["id"] = wc_id_map[product.Twr_TwrId]
+                products_to_update.append(product_data)
+                log.debug(f"Przygotowano produkt do aktualizacji: {product_data}")
+            else:
+                # Nowy produkt
+                products_to_create.append(product_data)
+                log.debug(f"Przygotowano produkt do utworzenia: {product_data}")
 
-        success, created_items, _, _ = batch_sync_products(creations=list(products_to_create.values()))
+        success, created_items, updated_items, _ = batch_sync_products(
+            creations=products_to_create,
+            updates=products_to_update
+        )
         
         if not success:
             return False
         
         total_synced = 0
-        for idx, item in enumerate(created_items):
-            if item.get("id") and not item.get("error"):
-                product_data_index = idx  # Indeks w oryginalnej liście produktów
-                comarch_id = list(products_to_create.keys())[product_data_index]
-                cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
-                    USING (VALUES ({comarch_id}, {item.get("id")})) AS source (Twr_TwrId, WC_ID)
-                    ON target.Twr_TwrId = source.Twr_TwrId OR target.WC_ID = source.WC_ID
-                    WHEN MATCHED THEN
-                        UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
-                    WHEN NOT MATCHED THEN
-                        INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
-
-                total_synced += 1
         
-        log.info(f"Zakończono synchronizacje produktów. Zsynchronizowano {total_synced}/{len(products_to_create)} produktów.")
+        # Zapisujemy nowo utworzone produkty do tabeli WoocommerceIDs
+        for item in created_items:
+            if item.get("id") and not item.get("error"):
+                # Znajdujemy Comarch ID (Twr_TwrId) na podstawie SKU
+                comarch_id = item.get("sku")
+                if comarch_id:
+                    cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
+                        USING (VALUES ({comarch_id}, {item.get("id")})) AS source (Twr_TwrId, WC_ID)
+                        ON target.Twr_TwrId = source.Twr_TwrId OR target.WC_ID = source.WC_ID
+                        WHEN MATCHED THEN
+                            UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
+                        WHEN NOT MATCHED THEN
+                            INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
+                    total_synced += 1
+        
+        # Zliczamy zaktualizowane produkty
+        total_updated = len([i for i in updated_items if not i.get("error")])
+        total_created = len([i for i in created_items if not i.get("error")])
+        
+        log.info(f"Zakończono synchronizacje produktów. Utworzono {total_created}, zaktualizowano {total_updated} produktów.")
         
         # Aktualizujemy wersje śledzenia zmian po udanej synchronizacji
         for table_key, version in current_versions.items():
