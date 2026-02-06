@@ -8,8 +8,8 @@ import os
 import argparse
 import json
 
-# Ścieżka do pliku JSON przechowującego wersje śledzenia zmian
-CHANGE_TRACKING_FILE = os.path.join(os.path.dirname(__file__), "change_tracking_versions.json")
+# Ścieżka do pliku JSON przechowującego czas synchronizacji
+SYNC_STATE_FILE = os.path.join(os.path.dirname(__file__), "sync_state.json")
 
 # Konfiguracja logowania
 from logging_formatter import CustomFormatter
@@ -29,8 +29,8 @@ wcapi = None
 args = None
 conn = None
 
-# Słownik przechowujący wersje śledzenia zmian (ładowany/zapisywany do JSON)
-change_tracking_versions = {}
+# slownik timestampu ISO ostaniej synchronizacji
+sync_state = {}
 
 __conn = None
 __cursor = None
@@ -276,8 +276,8 @@ def main():
     global args
     args = parser.parse_args()
     
-    # Wczytanie wersji śledzenia zmian
-    load_change_tracking_versions()
+    # Wczytanie stanu synchronizacji
+    load_sync_state()
     
     # Połączenie z bazą danych i WooCommerce API
     global cursor, conn, wcapi
@@ -301,74 +301,142 @@ def main():
     # Synchronizacja produktów
     success = sync_products()
     
-    # Zapisanie zaktualizowanych wersji śledzenia zmian
-    if success: save_change_tracking_versions()
+    # Zapisanie zaktualizowanego stanu synchronizacji
+    if success: save_sync_state()
 
-def is_already_enabled_error(error):
+def is_temporal_enabled(table_name: str, schema: str = 'CDN') -> bool:
     """
-    Sprawdza czy błąd oznacza że change tracking jest już włączone.
-    """
-    msg = str(error).lower()
-    return "change tracking" in msg and ("already enabled" in msg or "already been enabled" in msg)
-
-def load_change_tracking_versions():
-    """
-    Wczytuje wersje śledzenia zmian z pliku JSON.
-    """
-    global change_tracking_versions
-    if os.path.exists(CHANGE_TRACKING_FILE):
-        try:
-            with open(CHANGE_TRACKING_FILE, 'r', encoding='utf-8') as f:
-                change_tracking_versions = json.load(f)
-            log.debug(f"Wczytano wersje śledzenia zmian z {CHANGE_TRACKING_FILE}")
-        except (json.JSONDecodeError, IOError) as e:
-            log.warning(f"Nie udało się wczytać wersji śledzenia zmian: {e}. Tworzenie nowego pliku.")
-            change_tracking_versions = {}
-    else:
-        change_tracking_versions = {}
-        log.debug(f"Plik {CHANGE_TRACKING_FILE} nie istnieje. Tworzenie nowego.")
-
-
-def save_change_tracking_versions():
-    """
-    Zapisuje wersje śledzenia zmian do pliku JSON.
-    """
-    try:
-        with open(CHANGE_TRACKING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(change_tracking_versions, f, indent=2, ensure_ascii=False)
-        log.debug(f"Zapisano wersje śledzenia zmian do {CHANGE_TRACKING_FILE}")
-    except IOError as e:
-        log.error(f"Nie udało się zapisać wersji śledzenia zmian: {e}")
-
-
-def get_current_change_tracking_version(table_key: str) -> int | None:
-    """
-    Pobiera aktualną wersję śledzenia zmian dla danej tabeli z bazy danych.
-    
-    Args:
-        table_key: Klucz tabeli w formacie "[db].[schema].[table]"
-        
-    Returns:
-        Aktualna wersja CHANGE_TRACKING_CURRENT_VERSION() lub None w przypadku błędu
+    Sprawdza czy temporal tables są już włączone dla danej tabeli.
     """
     database_name = os.getenv("database_name")
     try:
-        # Pobieramy aktualną wersję z bazy (jest to jedna wartość na całą bazę danych)
-        cursor.execute('''SELECT CHANGE_TRACKING_CURRENT_VERSION()''')
+        cursor.execute(f'''
+            SELECT 1 FROM sys.tables t
+            JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = '{schema}' AND t.name = '{table_name}'
+            AND t.temporal_type IN (1, 2)
+        ''')
+        return cursor.fetchone() is not None
+    except pyodbc.Error:
+        return False
+
+def load_sync_state():
+    """
+    Wczytuje stan synchronizacji z pliku JSON.
+    """
+    global sync_state
+    if os.path.exists(SYNC_STATE_FILE):
+        try:
+            with open(SYNC_STATE_FILE, 'r', encoding='utf-8') as f:
+                sync_state = json.load(f)
+            log.debug(f"Wczytano stan synchronizacji z {SYNC_STATE_FILE}")
+        except (json.JSONDecodeError, IOError) as e:
+            log.error(f"Nie udało się wczytać stanu synchronizacji: {e}")
+            raise
+    else:
+        sync_state = {}
+        log.debug(f"Plik {SYNC_STATE_FILE} nie istnieje. Tworzenie nowego.")
+
+
+def save_sync_state():
+    """
+    Zapisuje stan synchronizacji do pliku JSON.
+    """
+    try:
+        with open(SYNC_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(sync_state, f, indent=2, ensure_ascii=False)
+        log.debug(f"Zapisano stan synchronizacji do {SYNC_STATE_FILE}")
+    except IOError as e:
+        log.error(f"Nie udało się zapisać stanu synchronizacji: {e}")
+
+
+def get_current_timestamp() -> str | None:
+    """
+    Pobiera aktualny znacznik czasu z bazy danych.
+    
+    Returns:
+        Aktualny timestamp w formacie ISO lub None w przypadku błędu
+    """
+    try:
+        cursor.execute('''SELECT SYSUTCDATETIME()''')
         row = cursor.fetchone()
         if row:
-            return row[0]
+            return row[0].isoformat() if hasattr(row[0], 'isoformat') else str(row[0])
     except pyodbc.Error as e:
-        log.error(f"Błąd podczas pobierania wersji śledzenia zmian dla {table_key}: {e}")
+        log.error(f"Błąd podczas pobierania aktualnego czasu z bazy: {e}")
     return None
+
+
+def get_changed_columns(twr_id: int, last_sync: str, current_time: str) -> dict:
+    """
+    Pobiera szczegółowe informacje o zmianach w kolumnach dla danego produktu.
+    Używa tabel tymczasowych (temporal tables) do porównania stanu sprzed i po synchronizacji.
+    
+    Args:
+        twr_id: ID produktu w tabeli Towary
+        last_sync: Znacznik czasu ostatniej synchronizacji (ISO format)
+        current_time: Aktualny znacznik czasu (ISO format)
+        
+    Returns:
+        Słownik z nazwami zmienionych kolumn i ich wartościami (stara_wartosc -> nowa_wartosc)
+    """
+    database_name = os.getenv("database_name")
+    changes = {}
+    
+    try:
+        # Pobieramy zmiany z tabeli Towary
+        cursor.execute(f'''
+            SELECT 
+                t_now.Twr_Nazwa AS nowa_nazwa,
+                t_history.Twr_Nazwa AS stara_nazwa,
+                t_now.Twr_Opis AS nowy_opis,
+                t_history.Twr_Opis AS stary_opis
+            FROM [{database_name}].[CDN].[Towary] t_now
+            LEFT JOIN [{database_name}].[CDN].[Towary]
+                FOR SYSTEM_TIME AS OF '{last_sync}' t_history
+                ON t_now.Twr_TwrId = t_history.Twr_TwrId
+            WHERE t_now.Twr_TwrId = {twr_id}
+        ''')
+        row = cursor.fetchone()
+        if row:
+            if row.stara_nazwa != row.nowa_nazwa:
+                changes['Twr_Nazwa'] = {'old': row.stara_nazwa, 'new': row.nowa_nazwa}
+            if row.stary_opis != row.nowy_opis:
+                changes['Twr_Opis'] = {'old': row.stary_opis, 'new': row.nowy_opis}
+        
+        # Pobieramy zmiany z tabeli TwrCeny
+        cursor.execute(f'''
+            SELECT 
+                tc_now.TwC_Wartosc AS nowa_wartosc,
+                tc_history.TwC_Wartosc AS stara_wartosc,
+                tc_now.TwC_Zaokraglenie AS nowe_zaokraglenie,
+                tc_history.TwC_Zaokraglenie AS stare_zaokraglenie
+            FROM [{database_name}].[CDN].[TwrCeny] tc_now
+            LEFT JOIN [{database_name}].[CDN].[TwrCeny]
+                FOR SYSTEM_TIME AS OF '{last_sync}' tc_history
+                ON tc_now.TwC_TwrID = tc_history.TwC_TwrID 
+                AND tc_now.TwC_Typ = tc_history.TwC_Typ
+            WHERE tc_now.TwC_TwrID = {twr_id}
+            AND tc_now.TwC_Typ = 2
+        ''')
+        row = cursor.fetchone()
+        if row:
+            old_price = round(row.stara_wartosc / row.stare_zaokraglenie) * row.stare_zaokraglenie if row.stara_wartosc else None
+            new_price = round(row.nowa_wartosc / row.nowe_zaokraglenie) * row.nowe_zaokraglenie if row.nowa_wartosc else None
+            if old_price != new_price:
+                changes['Cena'] = {'old': old_price, 'new': new_price}
+                
+    except pyodbc.Error as e:
+        log.error(f"Nie udało się pobrać szczegółowych zmian dla produktu {twr_id}: {e}")
+    
+    return changes
 
 def setup():
     """
-    Konfigugurje baze danych do synchronizacji.
-    Obsługuje przypadki częściowego włączenia śledzenia zmian.
-    Tworzy schemat ERPFlow i tabelę WoocommerceIDs jeśli nie istnieją.
+    Konfiguruje bazę danych do synchronizacji używając tabel tymczasowych (temporal tables).
+    Tworzy schemat ERPFlow, tabelę WoocommerceIDs oraz włącza temporal tables tam gdzie trzeba.
     """
-    database_name = os.getenv("database_name")
+    # Lista tabel, dla których chcemy włączyć temporal tables
     tracked_tables = ["Towary", "TwrCeny"]
     
     try:
@@ -377,7 +445,7 @@ def setup():
             cursor.execute(f'''IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ERPFlow') EXEC('CREATE SCHEMA ERPFlow');''')
             log.debug(f"Utworzono lub schemat 'ERPFlow' już istnieje.")
         except pyodbc.Error as schema_error:
-            log.warning(f"Nie udało się utworzyć schematu 'ERPFlow': {schema_error}")
+            log.error(f"Nie udało się utworzyć schematu 'ERPFlow': {schema_error}")
             raise
         
         # Utworzenie tabeli WoocommerceIDs jeśli nie istnieje
@@ -392,28 +460,51 @@ def setup():
             ''')
             log.debug(f"Utworzono lub tabela 'WoocommerceIDs' już istnieje.")
         except pyodbc.Error as table_error:
-            log.warning(f"Nie udało się utworzyć tabeli 'WoocommerceIDs': {table_error}")
+            log.error(f"Nie udało się utworzyć tabeli 'WoocommerceIDs': {table_error}")
             raise
         
-        try:
-            cursor.execute(f'''ALTER DATABASE [{database_name}] SET CHANGE_TRACKING = ON (AUTO_CLEANUP = ON, CHANGE_RETENTION = 2 DAYS);''')
-            log.debug(f"Śledzenie zmian włączone dla bazy danych '{database_name}'.")
-        except pyodbc.Error as db_error:
-            if is_already_enabled_error(db_error):
-                log.warning(f"Śledzenie zmian jest już włączone dla bazy danych '{database_name}'.")
-            else:
-                raise
-        
-        # Włącz śledzenie zmian dla każdej tabeli osobno używając w pełni kwalifikowanych nazw
+        # Włączamy temporal tables dla każdej tabeli
         for table in tracked_tables:
             try:
-                cursor.execute(f'''ALTER TABLE [{database_name}].[CDN].[{table}] ENABLE CHANGE_TRACKING;''')
-                log.debug(f"Włączono śledzenie zmian dla tabeli '{table}'.")
+                if is_temporal_enabled(table):
+                    log.debug(f"Temporal table jest już włączone dla tabeli '{table}'.")
+                    continue
+                    
+                # Sprawdzamy czy tabela ma już kolumny period
+                cursor.execute(f'''
+                    SELECT COUNT(*) FROM sys.columns c
+                    JOIN sys.tables t ON c.object_id = t.object_id
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    WHERE s.name = 'CDN' AND t.name = '{table}'
+                    AND c.name IN ('ValidFrom', 'ValidTo')
+                ''')
+                period_cols = cursor.fetchone()[0]
+                
+                if period_cols < 2:
+                    # Dodajemy kolumny period jeśli nie istnieją
+                    cursor.execute(f'''
+                        ALTER TABLE [CDN].[{table}]
+                        ADD ValidFrom DATETIME2(0) GENERATED ALWAYS AS ROW START HIDDEN DEFAULT SYSUTCDATETIME(),
+                            ValidTo DATETIME2(0) GENERATED ALWAYS AS ROW END HIDDEN DEFAULT CONVERT(DATETIME2(0), '9999-12-31 23:59:59'),
+                            PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo);
+                    ''')
+                    log.debug(f"Dodano kolumny period dla tabeli '{table}'.")
+                
+                # Włączamy temporal table
+                cursor.execute(f'''
+                    ALTER TABLE [CDN].[{table}]
+                    SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = CDN.{table}History, HISTORY_RETENTION_PERIOD = 6 MONTHS));
+                ''')
+                log.info(f"Włączono temporal table dla tabeli '{table}'.")
+                
             except pyodbc.Error as table_error:
-                if is_already_enabled_error(table_error):
-                    log.warning(f"Śledzenie zmian jest już włączone dla tabeli '{table}'.")
+                error_msg = str(table_error).lower()
+                if "already" in error_msg or "istnieje" in error_msg or "exists" in error_msg:
+                    log.warning(f"Temporal table lub jego elementy mogą już istnieć dla tabeli '{table}': {table_error}")
                 else:
+                    log.error(f"Błąd podczas włączania temporal table dla '{table}': {table_error}")
                     raise
+        
         log.info("Konfiguracja bazy danych zakończona pomyślnie.")
     except pyodbc.Error as e:
         log.error(f"Błąd podczas konfiguracji bazy danych: {e}")
@@ -422,9 +513,9 @@ def setup():
 def regenerate():
     """
     Usuwa wszystkie produkty z WooCommerce, które mają swoje ID w tabeli WoocommerceIDs,
-    resetuje wersję śledzenia zmian do 0 i uruchamia synchronizację.
+    resetuje znacznik czasu synchronizacji i uruchamia pełną synchronizację.
     """
-    global change_tracking_versions
+    global sync_state
     
     log.info("Rozpoczynanie regeneracji produktów...")
     
@@ -444,25 +535,16 @@ def regenerate():
         else:
             log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
         
-        # Resetujemy wersję śledzenia zmian do 0
-        database_name = os.getenv("database_name")
-        tables = [f"[{database_name}].[CDN].[Towary]", f"[{database_name}].[CDN].[TwrCeny]"]
-        
-        for table_key in tables:
-            change_tracking_versions[table_key] = 0
-            log.debug(f"Zresetowano wersję śledzenia zmian dla {table_key} do 0.")
-        
-        # Zapisujemy zresetowane wersje
-        save_change_tracking_versions()
-        log.info("Zresetowano wersje śledzenia zmian do 0.")
+        # Resetujemy znacznik czasu synchronizacji
+        sync_state = {}
+        save_sync_state()
+        log.info("Zresetowano znacznik czasu synchronizacji.")
         
         # Uruchamiamy synchronizację
         log.info("Rozpoczynanie synchronizacji produktów...")
         success = sync_products()
         
-        # Zapisujemy zaktualizowane wersje śledzenia zmian
         if success:
-            save_change_tracking_versions()
             log.info("Regeneracja zakończona pomyślnie.")
         else:
             log.error("Regeneracja zakończona z błędami.")
@@ -474,56 +556,78 @@ def regenerate():
 def sync_products() -> bool:
     """
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
+    
     Returns:
         bool: True jeśli synchronizacja zakończyła się sukcesem, False w przeciwnym razie.
     """
     database_name = os.getenv("database_name")
-    tables = [f"[{database_name}].[CDN].[Towary]", f"[{database_name}].[CDN].[TwrCeny]"]
     status = True
     
-    # Pobieramy aktualne wersje dla tabel (przed synchronizacją)
-    current_versions = {}
-    for table_key in tables:
-        version = get_current_change_tracking_version(table_key)
-        if version is None:
-            log.error(f"Nie udało się pobrać wersji śledzenia zmian dla {table_key}. Przerywanie synchronizacji.")
-            return False
-        current_versions[table_key] = version
-        last_sync_version = change_tracking_versions.get(table_key, 0)
-        log.debug(f"Tabela {table_key}: ostatnia wersja = {last_sync_version}, aktualna = {version}")
+    # Pobieramy aktualny czas przed synchronizacją
+    current_timestamp = get_current_timestamp()
+    if current_timestamp is None:
+        log.error("Nie udało się pobrać aktualnego czasu z bazy danych. Przerywanie synchronizacji.")
+        return False
+    
+    last_sync_timestamp = sync_state.get('last_sync_timestamp')
+    log.debug(f"Ostatnia synchronizacja: {last_sync_timestamp}, aktualny czas: {current_timestamp}")
     
     try:
-        # Jeśli mamy zapisaną wersję, używamy CHANGETABLE do pobrania tylko zmian
+        # Jeśli mamy zapisaną synchronizację, używamy temporal tables do pobrania tylko zmian
         # W przeciwnym razie (pierwsza synchronizacja) pobieramy wszystko
-        has_previous_sync = all(
-            change_tracking_versions.get(table_key) is not None
-            for table_key in tables
-        )
+        has_previous_sync = last_sync_timestamp is not None
         
+        # Sprawdź czy temporal tables są włączone jeśli planujemy ich użyć
         if has_previous_sync and not args.full_rebuild:
-            last_version = min(change_tracking_versions.get(table_key, 0) for table_key in tables)
-            # Synchronizacja z użyciem CHANGETABLE
-            log.debug("Wykryto poprzednią synchronizację.")
+            if not is_temporal_enabled('Towary') or not is_temporal_enabled('TwrCeny'):
+                log.warning("Temporal tables nie są włączone dla tabel Towary/TwrCeny.")
+                log.warning("Uruchom aplikację z flagą --setup, aby skonfigurować bazę danych.")
+                # return False
+                log.warning("Przełączam na pełną synchronizację.")
+                args.full_rebuild = True
+        
+        # Synchronizacja
+        if has_previous_sync and not args.full_rebuild:
+            log.debug("Wykryto poprzednią synchronizację. Pobieranie zmienionych produktów.")
             
             query = f'''
-                SELECT DISTINCT GREATEST(ct_t.SYS_CHANGE_VERSION, ct_tc.SYS_CHANGE_VERSION) AS SYS_CHANGE_VERSION,
-                                t.Twr_TwrId,
-                                t.Twr_Nazwa,
-                                t.Twr_Opis,
-                                tc.TwC_Wartosc,
-                                tc.TwC_Zaokraglenie
+                SELECT DISTINCT 
+                    t.Twr_TwrId,
+                    t.Twr_Nazwa,
+                    t.Twr_Opis,
+                    tc.TwC_Wartosc,
+                    tc.TwC_Zaokraglenie
                 FROM [{database_name}].[CDN].[Towary] t
-                INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
-                LEFT JOIN CHANGETABLE(CHANGES [{database_name}].[CDN].[Towary], {last_version}) ct_t ON t.Twr_TwrId = ct_t.Twr_TwrId
-                LEFT JOIN CHANGETABLE(CHANGES [{database_name}].[CDN].[TwrCeny], {last_version}) ct_tc ON tc.TwC_TwrID = ct_tc.TwC_TwCID
+                INNER JOIN [{database_name}].[CDN].[TwrCeny] tc 
+                    ON t.Twr_TwrId = tc.TwC_TwrID
                 WHERE tc.TwC_Typ = 2
-                AND (ct_t.SYS_CHANGE_VERSION IS NOT NULL
-                    OR ct_tc.SYS_CHANGE_VERSION IS NOT NULL)
+                AND (
+                    -- Zmiany w tabeli Towary od ostatniej synchronizacji
+                    EXISTS (
+                        SELECT 1 FROM [{database_name}].[CDN].[Towary] 
+                        FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{current_timestamp}' th
+                        WHERE th.Twr_TwrId = t.Twr_TwrId
+                        AND th.ValidFrom > '{last_sync_timestamp}'
+                    )
+                    OR
+                    -- Zmiany w tabeli TwrCeny od ostatniej synchronizacji
+                    EXISTS (
+                        SELECT 1 FROM [{database_name}].[CDN].[TwrCeny] 
+                        FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{current_timestamp}' tch
+                        WHERE tch.TwC_TwrID = tc.TwC_TwrID
+                        AND tch.TwC_Typ = 2
+                        AND tch.ValidFrom > '{last_sync_timestamp}'
+                    )
+                )
             '''
             cursor.execute(query)
         else:
             # Pełna synchronizacja - wszystkie rekordy
-            log.info("Brak poprzedniej synchronizacji. Pobieranie wszystkich produktów.")
+            if has_previous_sync:
+                log.info("Pełna przebudowa: pobieranie wszystkich produktów.")
+            else:
+                log.info("Brak poprzedniej synchronizacji. Pobieranie wszystkich produktów.")
+            
             query = f'''
                 SELECT DISTINCT t.Twr_TwrId, Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie 
                 FROM [{database_name}].[CDN].[Towary] t
@@ -537,6 +641,8 @@ def sync_products() -> bool:
         # Sprawdzamy czy jest coś do synchronizacji
         if not products:
             log.info("Brak nowych lub zmienionych produktów do synchronizacji.")
+            # Aktualizujemy znacznik czasu nawet gdy nie ma zmian
+            sync_state['last_sync_timestamp'] = current_timestamp
             return True
 
         # Pobieramy mapowanie Comarch ID -> WooCommerce ID
@@ -567,11 +673,22 @@ def sync_products() -> bool:
                 # Produkt istnieje - dodajemy ID do aktualizacji
                 product_data["id"] = wc_id_map[product.Twr_TwrId]
                 products_to_update.append(product_data)
+                
+                # Logowanie szczegółowych zmian 
+                if has_previous_sync and not args.full_rebuild:
+                    changes = get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp)
+                    if changes:
+                        change_details = ", ".join([
+                            f"{col}: {info.get('old')} -> {info.get('new')}" 
+                            for col, info in changes.items()
+                        ])
+                        log.debug(f"Zmiany w produkcie ID={product.Twr_TwrId}: {change_details}")
+                
                 log.debug(f"Przygotowano produkt do aktualizacji: {product_data}")
             else:
                 # Nowy produkt
                 products_to_create.append(product_data)
-                log.debug(f"Przygotowano produkt do utworzenia: {product_data}")
+                log.debug(f"Przygotowano nowy produkt do utworzenia: {product_data}")
 
         success, created_items, updated_items, _ = batch_sync_products(
             creations=products_to_create,
@@ -580,8 +697,6 @@ def sync_products() -> bool:
         
         if not success:
             return False
-        
-        total_synced = 0
         
         # Zapisujemy nowo utworzone produkty do tabeli WoocommerceIDs
         for item in created_items:
@@ -596,7 +711,6 @@ def sync_products() -> bool:
                             UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
                         WHEN NOT MATCHED THEN
                             INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
-                    total_synced += 1
         
         # Zliczamy zaktualizowane produkty
         total_updated = len([i for i in updated_items if not i.get("error")])
@@ -604,10 +718,9 @@ def sync_products() -> bool:
         
         log.info(f"Zakończono synchronizacje produktów. Utworzono {total_created}, zaktualizowano {total_updated} produktów.")
         
-        # Aktualizujemy wersje śledzenia zmian po udanej synchronizacji
-        for table_key, version in current_versions.items():
-            change_tracking_versions[table_key] = version
-            log.debug(f"Zaktualizowano wersję śledzenia zmian dla {table_key}: {version}")
+        # Aktualizujemy znacznik czasu po udanej synchronizacji
+        sync_state['last_sync_timestamp'] = current_timestamp
+        log.debug(f"Zaktualizowano znacznik czasu synchronizacji: {current_timestamp}")
             
     except Exception as e:
         log.error(f"Błąd podczas synchronizacji produktów: {e}", stack_info=True)
