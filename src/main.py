@@ -660,13 +660,24 @@ def sync_products() -> bool:
             if float(regular_price) == 0 and not args.obejmuj_darmowe_towary:
                 log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
                 continue
-            
+
+            changes = get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp)
             product_data = {
-                "name": product.Twr_Nazwa,
-                "description": product.Twr_Opis,
-                "regular_price": regular_price,
-                "sku": product.Twr_TwrId,
+                "sku": product.Twr_TwrId
             }
+            if changes:
+                # Jeśli są zmiany, dodajemy tylko zmienione pola do danych produktu
+                if 'Twr_Nazwa' in changes: product_data["name"] = changes['Twr_Nazwa']['new']
+                if 'Twr_Opis' in changes: product_data["description"] = changes['Twr_Opis']['new']
+                if 'Cena' in changes: product_data["regular_price"] = str(changes['Cena']['new'])
+            else:
+                # Jeśli nie ma zmian (np. przy pełnej synchronizacji), używamy aktualnych wartości z bazy
+                product_data = {
+                    "name": product.Twr_Nazwa,
+                    "description": product.Twr_Opis,
+                    "regular_price": regular_price
+                }
+            
             
             # Sprawdzamy czy produkt już istnieje w WooCommerce
             if product.Twr_TwrId in wc_id_map:
@@ -676,7 +687,6 @@ def sync_products() -> bool:
                 
                 # Logowanie szczegółowych zmian 
                 if has_previous_sync and not args.full_rebuild:
-                    changes = get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp)
                     if changes:
                         change_details = ", ".join([
                             f"{col}: {info.get('old')} -> {info.get('new')}" 
