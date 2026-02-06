@@ -2,107 +2,22 @@ import time
 import pyodbc
 from woocommerce import API
 from requests.exceptions import HTTPError
-import logging
 from dotenv import load_dotenv
 import os
 import argparse
 import json
+from connections import wcapi, cursor
+import logger as log
 
 # Ścieżka do pliku JSON przechowującego czas synchronizacji
 SYNC_STATE_FILE = os.path.join(os.path.dirname(__file__), "sync_state.json")
 
-# Konfiguracja logowania
-from logging_formatter import CustomFormatter
-log = logging.getLogger("My_app")
-log.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-ch.setFormatter(CustomFormatter())
-log.addHandler(ch)
-
-# env
-load_dotenv()
-
 # Zmienne globalne
-cursor = None
-wcapi = None
 args = None
 conn = None
 
 # slownik timestampu ISO ostaniej synchronizacji
 sync_state = {}
-
-__conn = None
-__cursor = None
-def get_database_connection():
-    """
-    Nawiązuje połączenie z bazą danych MSSQL (singleton) używając pyodbc.
-    Returns:
-        pyodbc.Cursor: Kursor do bazy danych MSSQL.
-    """
-    global __conn, __cursor
-    if __cursor is not None:
-        return __cursor
-    try:
-        log.debug(f"Łączenie z bazą danych MSSQL na hoście {os.getenv('database_host')}")
-        
-        host = os.getenv('database_host') 
-        database = os.getenv('database_name')
-        user = os.getenv('database_user')
-        password = os.getenv('database_password')
-        domain = os.getenv('database_domain')
-        driver = os.getenv('database_driver', '{ODBC Driver 17 for SQL Server}')
-
-        conn_str_parts = [
-            f"DRIVER={driver}",
-            f"SERVER={host}",
-            f"DATABASE={database}",
-            "TrustServerCertificate=yes",
-        ]
-
-        if user and password:
-            # SQL auth
-            if domain: conn_str_parts.append(f"UID={domain}\\{user}")
-            else: conn_str_parts.append(f"UID={user}")
-            conn_str_parts.append(f"PWD={password}")
-        else:
-            # Windows auth
-            conn_str_parts.append("Trusted_Connection=yes")
-
-        connection_string = ";".join(conn_str_parts)
-
-        __conn = pyodbc.connect(connection_string)
-        __conn.autocommit = True
-        __cursor = __conn.cursor()
-        log.info("Połączono z bazą danych MSSQL (pyodbc).")
-        return __cursor, __conn
-    except Exception as e:
-        log.error(f"Błąd połączenia z bazą danych: {e}")
-        raise
-
-__wcapi = None
-def get_woocommerce_api():
-    """
-    Nawiązuje połączenie z WooCommerce API (singleton).
-    Returns:
-        woocommerce.API: Obiekt API WooCommerce.
-    """
-    global __wcapi
-    if __wcapi is not None:
-        return __wcapi
-    try:
-        __wcapi = API(
-            url=os.getenv("woocommerce_store_url"),
-            consumer_key=os.getenv("woocommerce_consumer_key"),
-            consumer_secret=os.getenv("woocommerce_consumer_secret"),
-            wp_api=True,
-            version="wc/v3",
-        )
-        log.info("Połączono z WooCommerce API.")
-        return __wcapi
-    except Exception as e:
-        log.error(f"Błąd połączenia z WooCommerce API: {e}")
-        raise
 
 def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None, deletions: list[int] = None) -> tuple[bool, list[dict], list[dict], list[dict]]:
     """
@@ -187,7 +102,7 @@ def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None
                     log.error(f"Błąd podczas tworzenia produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
                     status = False
                 else:
-                    log.info(f"Utworzono produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
+                    log.debug(f"Utworzono produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
             all_created.extend(created)
             create_idx += batch_created_count
             
@@ -235,7 +150,7 @@ def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None
         stats.append(f"{successful_updated_count}/{len(updates)} zaktualizowanych")
     if deletions:
         stats.append(f"{successful_deleted_count}/{len(deletions)} usuniętych")
-    log.info("Zakończono synchornizacje: " + ", ".join(stats) + " produktów.")
+    log.debug("Zakończono synchornizacje: " + ", ".join(stats) + " produktów.")
 
     return status, all_created, all_updated, all_deleted
 
@@ -275,18 +190,9 @@ def main():
     
     global args
     args = parser.parse_args()
-    
+
     # Wczytanie stanu synchronizacji
     load_sync_state()
-    
-    # Połączenie z bazą danych i WooCommerce API
-    global cursor, conn, wcapi
-    try:
-        cursor, conn = get_database_connection()
-        wcapi = get_woocommerce_api()
-    except Exception as e:
-        log.error(f"Błąd podczas łączenia się z zasobami: {e}")
-        raise
 
     # Konfiguracja bazy danych do śledzenia zmian jeśli flaga jest ustawiona (--setup)
     if args.setup:
@@ -302,7 +208,10 @@ def main():
     success = sync_products()
     
     # Zapisanie zaktualizowanego stanu synchronizacji
-    if success: save_sync_state()
+    if success: 
+        save_sync_state()
+    else:
+        log.warning("UWAGA: Synchronizacja zakończyła się z błędami. Mogą istnieć produkty w WooCommerce, które nie są poprawnie zapisane w Comarchu. Sprawdź logi powyżej, aby zidentyfikować problemy.")
 
 def is_temporal_enabled(table_name: str, schema: str = 'CDN') -> bool:
     """
@@ -645,10 +554,15 @@ def sync_products() -> bool:
             sync_state['last_sync_timestamp'] = current_timestamp
             return True
 
-        # Pobieramy mapowanie Comarch ID -> WooCommerce ID
-        cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
-        wc_id_map = {row[0]: row[1] for row in cursor.fetchall()}
-        log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań produktów.")
+        # Tworzymy mapowanie Comarch ID -> WooCommerce ID
+        if args.full_rebuild or args.regeneruj:
+            wc_id_map = {}
+            log.debug("Pełna przebudowa: reset istniejących mapowań produktów.")
+            cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
+        else:
+            cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+            wc_id_map = {row[0]: row[1] for row in cursor.fetchall()}
+            log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań produktów.")
 
         products_to_create = []
         products_to_update = []
@@ -672,11 +586,11 @@ def sync_products() -> bool:
                 if 'Cena' in changes: product_data["regular_price"] = str(changes['Cena']['new'])
             else:
                 # Jeśli nie ma zmian (np. przy pełnej synchronizacji), używamy aktualnych wartości z bazy
-                product_data = {
+                product_data.update({
                     "name": product.Twr_Nazwa,
                     "description": product.Twr_Opis,
                     "regular_price": regular_price
-                }
+                })
             
             
             # Sprawdzamy czy produkt już istnieje w WooCommerce
@@ -704,7 +618,6 @@ def sync_products() -> bool:
             creations=products_to_create,
             updates=products_to_update
         )
-        
         if not success:
             return False
         
@@ -721,6 +634,11 @@ def sync_products() -> bool:
                             UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
                         WHEN NOT MATCHED THEN
                             INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
+                    log.debug(f"Zmapowano Comarch ID {comarch_id} na WooCommerce ID {item.get('id')}.")
+                else:
+                    log.error(f"Nie można znaleźć Comarch ID dla utworzonego produktu WooCommerce ID {item.get('id')}. SKU: {item.get('sku')}")
+                    status = False
+
         
         # Zliczamy zaktualizowane produkty
         total_updated = len([i for i in updated_items if not i.get("error")])
@@ -737,6 +655,6 @@ def sync_products() -> bool:
         status = False
     return status
     
-    
 if __name__ == "__main__":
+    load_dotenv()
     main()
