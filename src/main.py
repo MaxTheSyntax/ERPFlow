@@ -8,16 +8,13 @@ import argparse
 import json
 from connections import wcapi, cursor
 import logger as log
-
-# Ścieżka do pliku JSON przechowującego czas synchronizacji
-SYNC_STATE_FILE = os.path.join(os.path.dirname(__file__), "sync_state.json")
+import db_sync as sync
 
 # Zmienne globalne
 args = None
 conn = None
 
-# slownik timestampu ISO ostaniej synchronizacji
-sync_state = {}
+
 
 def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None, deletions: list[int] = None) -> tuple[bool, list[dict], list[dict], list[dict]]:
     """
@@ -187,12 +184,19 @@ def main():
         default=False,
         help="Usuwa wszystkie produkty z WooCommerce, resetuje wersję śledzenia i synchronizuje ponownie."
     )
+    parser.add_argument(
+        "--wymus",
+        dest="force",
+        action="store_true",
+        default=False,
+        help="Wymusza traktowanie wszystkich produktów jako zmienionych, nawet jeśli nie można porównać stanu sprzed i po synchronizacji."
+    )
     
     global args
     args = parser.parse_args()
 
     # Wczytanie stanu synchronizacji
-    load_sync_state()
+    sync.load_sync_state()
 
     # Konfiguracja bazy danych do śledzenia zmian jeśli flaga jest ustawiona (--setup)
     if args.setup:
@@ -209,136 +213,9 @@ def main():
     
     # Zapisanie zaktualizowanego stanu synchronizacji
     if success: 
-        save_sync_state()
+        sync.save_sync_state()
     else:
         log.warning("UWAGA: Synchronizacja zakończyła się z błędami. Mogą istnieć produkty w WooCommerce, które nie są poprawnie zapisane w Comarchu. Sprawdź logi powyżej, aby zidentyfikować problemy.")
-
-def is_temporal_enabled(table_name: str, schema: str = 'CDN') -> bool:
-    """
-    Sprawdza czy temporal tables są już włączone dla danej tabeli.
-    """
-    database_name = os.getenv("database_name")
-    try:
-        cursor.execute(f'''
-            SELECT 1 FROM sys.tables t
-            JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name = '{schema}' AND t.name = '{table_name}'
-            AND t.temporal_type IN (1, 2)
-        ''')
-        return cursor.fetchone() is not None
-    except pyodbc.Error:
-        return False
-
-def load_sync_state():
-    """
-    Wczytuje stan synchronizacji z pliku JSON.
-    """
-    global sync_state
-    if os.path.exists(SYNC_STATE_FILE):
-        try:
-            with open(SYNC_STATE_FILE, 'r', encoding='utf-8') as f:
-                sync_state = json.load(f)
-            log.debug(f"Wczytano stan synchronizacji z {SYNC_STATE_FILE}")
-        except (json.JSONDecodeError, IOError) as e:
-            log.error(f"Nie udało się wczytać stanu synchronizacji: {e}")
-            raise
-    else:
-        sync_state = {}
-        log.debug(f"Plik {SYNC_STATE_FILE} nie istnieje. Tworzenie nowego.")
-
-
-def save_sync_state():
-    """
-    Zapisuje stan synchronizacji do pliku JSON.
-    """
-    try:
-        with open(SYNC_STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(sync_state, f, indent=2, ensure_ascii=False)
-        log.debug(f"Zapisano stan synchronizacji do {SYNC_STATE_FILE}")
-    except IOError as e:
-        log.error(f"Nie udało się zapisać stanu synchronizacji: {e}")
-
-
-def get_current_timestamp() -> str | None:
-    """
-    Pobiera aktualny znacznik czasu z bazy danych.
-    
-    Returns:
-        Aktualny timestamp w formacie ISO lub None w przypadku błędu
-    """
-    try:
-        cursor.execute('''SELECT SYSUTCDATETIME()''')
-        row = cursor.fetchone()
-        if row:
-            return row[0].isoformat() if hasattr(row[0], 'isoformat') else str(row[0])
-    except pyodbc.Error as e:
-        log.error(f"Błąd podczas pobierania aktualnego czasu z bazy: {e}")
-    return None
-
-
-def get_changed_columns(twr_id: int, last_sync: str, current_time: str) -> dict:
-    """
-    Pobiera szczegółowe informacje o zmianach w kolumnach dla danego produktu.
-    Używa tabel tymczasowych (temporal tables) do porównania stanu sprzed i po synchronizacji.
-    
-    Args:
-        twr_id: ID produktu w tabeli Towary
-        last_sync: Znacznik czasu ostatniej synchronizacji (ISO format)
-        current_time: Aktualny znacznik czasu (ISO format)
-        
-    Returns:
-        Słownik z nazwami zmienionych kolumn i ich wartościami (stara_wartosc -> nowa_wartosc)
-    """
-    database_name = os.getenv("database_name")
-    changes = {}
-    
-    try:
-        # Pobieramy zmiany z tabeli Towary
-        cursor.execute(f'''
-            SELECT 
-                t_now.Twr_Nazwa AS nowa_nazwa,
-                t_history.Twr_Nazwa AS stara_nazwa,
-                t_now.Twr_Opis AS nowy_opis,
-                t_history.Twr_Opis AS stary_opis
-            FROM [{database_name}].[CDN].[Towary] t_now
-            LEFT JOIN [{database_name}].[CDN].[Towary]
-                FOR SYSTEM_TIME AS OF '{last_sync}' t_history
-                ON t_now.Twr_TwrId = t_history.Twr_TwrId
-            WHERE t_now.Twr_TwrId = {twr_id}
-        ''')
-        row = cursor.fetchone()
-        if row:
-            if row.stara_nazwa != row.nowa_nazwa:
-                changes['Twr_Nazwa'] = {'old': row.stara_nazwa, 'new': row.nowa_nazwa}
-            if row.stary_opis != row.nowy_opis:
-                changes['Twr_Opis'] = {'old': row.stary_opis, 'new': row.nowy_opis}
-        
-        # Pobieramy zmiany z tabeli TwrCeny
-        cursor.execute(f'''
-            SELECT 
-                tc_now.TwC_Wartosc AS nowa_wartosc,
-                tc_history.TwC_Wartosc AS stara_wartosc,
-                tc_now.TwC_Zaokraglenie AS nowe_zaokraglenie,
-                tc_history.TwC_Zaokraglenie AS stare_zaokraglenie
-            FROM [{database_name}].[CDN].[TwrCeny] tc_now
-            LEFT JOIN [{database_name}].[CDN].[TwrCeny]
-                FOR SYSTEM_TIME AS OF '{last_sync}' tc_history
-                ON tc_now.TwC_TwrID = tc_history.TwC_TwrID 
-                AND tc_now.TwC_Typ = tc_history.TwC_Typ
-            WHERE tc_now.TwC_TwrID = {twr_id}
-            AND tc_now.TwC_Typ = 2
-        ''')
-        row = cursor.fetchone()
-        if row:
-            old_price = round(row.stara_wartosc / row.stare_zaokraglenie) * row.stare_zaokraglenie if row.stara_wartosc else None
-            new_price = round(row.nowa_wartosc / row.nowe_zaokraglenie) * row.nowe_zaokraglenie if row.nowa_wartosc else None
-            if old_price != new_price:
-                changes['Cena'] = {'old': old_price, 'new': new_price}
-                
-    except pyodbc.Error as e:
-        log.error(f"Nie udało się pobrać szczegółowych zmian dla produktu {twr_id}: {e}")
-    
-    return changes
 
 def setup():
     """
@@ -375,7 +252,7 @@ def setup():
         # Włączamy temporal tables dla każdej tabeli
         for table in tracked_tables:
             try:
-                if is_temporal_enabled(table):
+                if sync.is_temporal_enabled(table):
                     log.debug(f"Temporal table jest już włączone dla tabeli '{table}'.")
                     continue
                     
@@ -424,8 +301,6 @@ def regenerate():
     Usuwa wszystkie produkty z WooCommerce, które mają swoje ID w tabeli WoocommerceIDs,
     resetuje znacznik czasu synchronizacji i uruchamia pełną synchronizację.
     """
-    global sync_state
-    
     log.info("Rozpoczynanie regeneracji produktów...")
     
     try:
@@ -445,8 +320,8 @@ def regenerate():
             log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
         
         # Resetujemy znacznik czasu synchronizacji
-        sync_state = {}
-        save_sync_state()
+        sync.sync_state = {}
+        sync.save_sync_state()
         log.info("Zresetowano znacznik czasu synchronizacji.")
         
         # Uruchamiamy synchronizację
@@ -473,12 +348,12 @@ def sync_products() -> bool:
     status = True
     
     # Pobieramy aktualny czas przed synchronizacją
-    current_timestamp = get_current_timestamp()
+    current_timestamp = sync.get_current_timestamp()
     if current_timestamp is None:
         log.error("Nie udało się pobrać aktualnego czasu z bazy danych. Przerywanie synchronizacji.")
         return False
     
-    last_sync_timestamp = sync_state.get('last_sync_timestamp')
+    last_sync_timestamp = sync.sync_state.get('last_sync_timestamp')
     log.debug(f"Ostatnia synchronizacja: {last_sync_timestamp}, aktualny czas: {current_timestamp}")
     
     try:
@@ -488,7 +363,7 @@ def sync_products() -> bool:
         
         # Sprawdź czy temporal tables są włączone jeśli planujemy ich użyć
         if has_previous_sync and not args.full_rebuild:
-            if not is_temporal_enabled('Towary') or not is_temporal_enabled('TwrCeny'):
+            if not sync.is_temporal_enabled('Towary') or not sync.is_temporal_enabled('TwrCeny'):
                 log.warning("Temporal tables nie są włączone dla tabel Towary/TwrCeny.")
                 log.warning("Uruchom aplikację z flagą --setup, aby skonfigurować bazę danych.")
                 # return False
@@ -551,7 +426,7 @@ def sync_products() -> bool:
         if not products:
             log.info("Brak nowych lub zmienionych produktów do synchronizacji.")
             # Aktualizujemy znacznik czasu nawet gdy nie ma zmian
-            sync_state['last_sync_timestamp'] = current_timestamp
+            sync.sync_state['last_sync_timestamp'] = current_timestamp
             return True
 
         # Tworzymy mapowanie Comarch ID -> WooCommerce ID
@@ -575,7 +450,7 @@ def sync_products() -> bool:
                 log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
                 continue
 
-            changes = get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp)
+            changes = sync.get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp, force=args.force)
             product_data = {
                 "sku": product.Twr_TwrId
             }
@@ -647,7 +522,7 @@ def sync_products() -> bool:
         log.info(f"Zakończono synchronizacje produktów. Utworzono {total_created}, zaktualizowano {total_updated} produktów.")
         
         # Aktualizujemy znacznik czasu po udanej synchronizacji
-        sync_state['last_sync_timestamp'] = current_timestamp
+        sync.sync_state['last_sync_timestamp'] = current_timestamp
         log.debug(f"Zaktualizowano znacznik czasu synchronizacji: {current_timestamp}")
             
     except Exception as e:
