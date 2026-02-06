@@ -5,16 +5,13 @@ from requests.exceptions import HTTPError
 from dotenv import load_dotenv
 import os
 import argparse
-import json
-from connections import wcapi, cursor
+import connections as con
 import logger as log
 import db_sync as sync
 
 # Zmienne globalne
 args = None
 conn = None
-
-
 
 def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None, deletions: list[int] = None) -> tuple[bool, list[dict], list[dict], list[dict]]:
     """
@@ -90,7 +87,7 @@ def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None
             break
         
         try:
-            response = wcapi.post("products/batch", data).json()
+            response = con.wcapi.post("products/batch", data).json()
             
             # Przetwarzamy utworzone produkty
             created = response.get("create", [])
@@ -191,9 +188,22 @@ def main():
         default=False,
         help="Wymusza traktowanie wszystkich produktów jako zmienionych, nawet jeśli nie można porównać stanu sprzed i po synchronizacji."
     )
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Ustaw poziom logowania. Domyślnie: INFO."
+    )
     
     global args
     args = parser.parse_args()
+
+    log.set_log_level(args.log_level)
+
+    # Initialize connections after log level is set
+    con.initialize()
 
     # Wczytanie stanu synchronizacji
     sync.load_sync_state()
@@ -228,7 +238,7 @@ def setup():
     try:
         # Utworzenie schematu ERPFlow jeśli nie istnieje
         try:
-            cursor.execute(f'''IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ERPFlow') EXEC('CREATE SCHEMA ERPFlow');''')
+            con.cursor.execute(f'''IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'ERPFlow') EXEC('CREATE SCHEMA ERPFlow');''')
             log.debug(f"Utworzono lub schemat 'ERPFlow' już istnieje.")
         except pyodbc.Error as schema_error:
             log.error(f"Nie udało się utworzyć schematu 'ERPFlow': {schema_error}")
@@ -236,12 +246,12 @@ def setup():
         
         # Utworzenie tabeli WoocommerceIDs jeśli nie istnieje
         try:
-            cursor.execute(f'''
-                IF NOT EXISTS (SELECT 1 FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE s.name = 'ERPFlow' AND t.name = 'WoocommerceIDs')
+            con.cursor.execute(f'''
+                IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'WoocommerceIDs' AND schema_id = SCHEMA_ID('ERPFlow'))
                 CREATE TABLE [ERPFlow].[WoocommerceIDs] (
-                    Twr_TwrId INT NOT NULL UNIQUE,
-                    WC_ID INT NOT NULL PRIMARY KEY,
-                    CONSTRAINT FK_WoocommerceIDs_Towary FOREIGN KEY (Twr_TwrId) REFERENCES CDN.Towary(Twr_TwrId)
+                    Twr_TwrId INT PRIMARY KEY,
+                    WC_ID INT NOT NULL,
+                    LastSynced DATETIME2 DEFAULT GETDATE()
                 );
             ''')
             log.debug(f"Utworzono lub tabela 'WoocommerceIDs' już istnieje.")
@@ -257,27 +267,27 @@ def setup():
                     continue
                     
                 # Sprawdzamy czy tabela ma już kolumny period
-                cursor.execute(f'''
+                con.cursor.execute(f'''
                     SELECT COUNT(*) FROM sys.columns c
                     JOIN sys.tables t ON c.object_id = t.object_id
                     JOIN sys.schemas s ON t.schema_id = s.schema_id
                     WHERE s.name = 'CDN' AND t.name = '{table}'
                     AND c.name IN ('ValidFrom', 'ValidTo')
                 ''')
-                period_cols = cursor.fetchone()[0]
+                period_cols = con.cursor.fetchone()[0]
                 
                 if period_cols < 2:
                     # Dodajemy kolumny period jeśli nie istnieją
-                    cursor.execute(f'''
+                    con.cursor.execute(f'''
                         ALTER TABLE [CDN].[{table}]
-                        ADD ValidFrom DATETIME2(0) GENERATED ALWAYS AS ROW START HIDDEN DEFAULT SYSUTCDATETIME(),
-                            ValidTo DATETIME2(0) GENERATED ALWAYS AS ROW END HIDDEN DEFAULT CONVERT(DATETIME2(0), '9999-12-31 23:59:59'),
+                        ADD ValidFrom DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL DEFAULT SYSUTCDATETIME(),
+                            ValidTo DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL DEFAULT CONVERT(DATETIME2, '9999-12-31 23:59:59.9999999'),
                             PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo);
                     ''')
                     log.debug(f"Dodano kolumny period dla tabeli '{table}'.")
                 
                 # Włączamy temporal table
-                cursor.execute(f'''
+                con.cursor.execute(f'''
                     ALTER TABLE [CDN].[{table}]
                     SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = CDN.{table}History, HISTORY_RETENTION_PERIOD = 6 MONTHS));
                 ''')
@@ -305,8 +315,8 @@ def regenerate():
     
     try:
         # Pobieramy wszystkie ID produktów WooCommerce z tabeli WoocommerceIDs
-        cursor.execute('SELECT WC_ID FROM [ERPFlow].[WoocommerceIDs]')
-        wc_ids = [row[0] for row in cursor.fetchall()]
+        con.cursor.execute('SELECT WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+        wc_ids = [row[0] for row in con.cursor.fetchall()]
         
         if wc_ids:
             log.info(f"Znaleziono {len(wc_ids)} produktów do usunięcia z WooCommerce.")
@@ -314,7 +324,7 @@ def regenerate():
             batch_sync_products(deletions=wc_ids)
             
             # Czyścimy tabelę WoocommerceIDs
-            cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
+            con.cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
             log.info("Wyczyszczono tabelę WoocommerceIDs.")
         else:
             log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
@@ -404,7 +414,7 @@ def sync_products() -> bool:
                     )
                 )
             '''
-            cursor.execute(query)
+            con.cursor.execute(query)
         else:
             # Pełna synchronizacja - wszystkie rekordy
             if has_previous_sync:
@@ -418,9 +428,9 @@ def sync_products() -> bool:
                 INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
                 WHERE tc.TwC_Typ = 2
             '''
-            cursor.execute(query)
+            con.cursor.execute(query)
         
-        products = cursor.fetchall()
+        products = con.cursor.fetchall()
 
         # Sprawdzamy czy jest coś do synchronizacji
         if not products:
@@ -433,10 +443,10 @@ def sync_products() -> bool:
         if args.full_rebuild or args.regeneruj:
             wc_id_map = {}
             log.debug("Pełna przebudowa: reset istniejących mapowań produktów.")
-            cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
+            con.cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
         else:
-            cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
-            wc_id_map = {row[0]: row[1] for row in cursor.fetchall()}
+            con.cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+            wc_id_map = {row[0]: row[1] for row in con.cursor.fetchall()}
             log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań produktów.")
 
         products_to_create = []
@@ -502,7 +512,7 @@ def sync_products() -> bool:
                 # Znajdujemy Comarch ID (Twr_TwrId) na podstawie SKU
                 comarch_id = item.get("sku")
                 if comarch_id:
-                    cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
+                    con.cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
                         USING (VALUES ({comarch_id}, {item.get("id")})) AS source (Twr_TwrId, WC_ID)
                         ON target.Twr_TwrId = source.Twr_TwrId OR target.WC_ID = source.WC_ID
                         WHEN MATCHED THEN

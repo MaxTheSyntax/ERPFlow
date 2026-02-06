@@ -1,4 +1,4 @@
-from connections import cursor
+import connections as con
 import os
 import pyodbc
 import json
@@ -13,13 +13,13 @@ def is_temporal_enabled(table_name: str, schema: str = 'CDN') -> bool:
     """
     database_name = os.getenv("database_name")
     try:
-        cursor.execute(f'''
+        con.cursor.execute(f'''
             SELECT 1 FROM sys.tables t
             JOIN sys.schemas s ON t.schema_id = s.schema_id
             WHERE s.name = '{schema}' AND t.name = '{table_name}'
             AND t.temporal_type IN (1, 2)
         ''')
-        return cursor.fetchone() is not None
+        return con.cursor.fetchone() is not None
     except pyodbc.Error:
         return False
 
@@ -61,8 +61,8 @@ def get_current_timestamp() -> str | None:
         Aktualny timestamp w formacie ISO lub None w przypadku błędu
     """
     try:
-        cursor.execute('''SELECT SYSUTCDATETIME()''')
-        row = cursor.fetchone()
+        con.cursor.execute('''SELECT SYSUTCDATETIME()''')
+        row = con.cursor.fetchone()
         if row:
             if hasattr(row[0], 'isoformat'):
                 return row[0].strftime("%Y-%m-%d %H:%M:%S")
@@ -96,7 +96,7 @@ def get_changed_columns(twr_id: int, last_sync: str, current_time: str, force: b
         # Pobieramy zmiany z tabeli Towary
         # Konwertujemy last_sync na datetime w formacie ISO 8601 (YYYY-MM-DDTHH:MM:SS)
         last_sync_iso = last_sync.replace(' ', 'T') if ' ' in last_sync else last_sync
-        cursor.execute(f'''
+        con.cursor.execute(f'''
             SELECT 
                 t_now.Twr_Nazwa AS nowa_nazwa,
                 t_history.Twr_Nazwa AS stara_nazwa,
@@ -108,7 +108,7 @@ def get_changed_columns(twr_id: int, last_sync: str, current_time: str, force: b
                 ON t_now.Twr_TwrId = t_history.Twr_TwrId
             WHERE t_now.Twr_TwrId = ?
         ''', (last_sync_iso, twr_id))
-        row = cursor.fetchone()
+        row = con.cursor.fetchone()
         if row:
             if row.stara_nazwa != row.nowa_nazwa:
                 changes['Twr_Nazwa'] = {'old': row.stara_nazwa, 'new': row.nowa_nazwa}
@@ -116,7 +116,7 @@ def get_changed_columns(twr_id: int, last_sync: str, current_time: str, force: b
                 changes['Twr_Opis'] = {'old': row.stary_opis, 'new': row.nowy_opis}
         
         # Pobieramy zmiany z tabeli TwrCeny
-        cursor.execute(f'''
+        con.cursor.execute(f'''
             SELECT 
                 tc_now.TwC_Wartosc AS nowa_wartosc,
                 tc_history.TwC_Wartosc AS stara_wartosc,
@@ -130,7 +130,7 @@ def get_changed_columns(twr_id: int, last_sync: str, current_time: str, force: b
             WHERE tc_now.TwC_TwrID = ?
             AND tc_now.TwC_Typ = 2
         ''', (last_sync_iso, twr_id))
-        row = cursor.fetchone()
+        row = con.cursor.fetchone()
         if row:
             old_price = round(row.stara_wartosc / row.stare_zaokraglenie) * row.stare_zaokraglenie if row.stara_wartosc else None
             new_price = round(row.nowa_wartosc / row.nowe_zaokraglenie) * row.nowe_zaokraglenie if row.nowa_wartosc else None

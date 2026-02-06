@@ -15,6 +15,8 @@ python src/main.py [opcje]
 - `--setup` - Inicjalizuje śledzenie zmian w bazie danych. Należy uruchomić przed pierwszą synchronizacją.
 - `--odtworz` - Tworzy wszystkie elementy bez względu na istniejące dane.
 - `--regeneruj` - Usuwa wszystkie elementy i tworzy je ponownie. Używaj ostrożnie, ponieważ może prowadzić do utraty danych.
+- `--wymus` - Wymusza synchronizację nawet jeżeli nastąpią błędy.
+- `--log-level [poziom]` - Ustawia poziom logowania (DEBUG, INFO, WARNING, ERROR). Domyślnie INFO.
 
 # Instalacja
 

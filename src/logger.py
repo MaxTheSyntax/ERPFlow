@@ -38,6 +38,12 @@ ch.setLevel(logging.DEBUG)
 ch.setFormatter(CustomFormatter())
 log.addHandler(ch)
 
+def set_log_level(level: str):
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f'Invalid log level: {level}')
+    log.setLevel(numeric_level)
+
 def debug(msg, **kwargs):
     log.debug(msg, stacklevel=2, **kwargs)
 def info(msg, **kwargs):

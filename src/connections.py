@@ -79,10 +79,12 @@ def __get_woocommerce_api():
         log.error(f"Błąd połączenia z WooCommerce API: {e}")
         raise
 
-# def initialize():
-#     global cursor, wcapi
-#     cursor = __get_database_connection()
-#     wcapi = __get_woocommerce_api()
-load_dotenv()
-cursor, conn = __get_database_connection()
-wcapi = __get_woocommerce_api()
+def initialize():
+    global cursor, conn, wcapi
+    load_dotenv()
+    cursor, conn = __get_database_connection()
+    wcapi = __get_woocommerce_api()
+
+cursor = None
+conn = None
+wcapi = None
