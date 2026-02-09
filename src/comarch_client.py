@@ -81,7 +81,7 @@ def get_changed_columns(twr_id: int, last_sync: str, current_time: str, force: b
         twr_id: ID produktu w tabeli Towary
         last_sync: Znacznik czasu ostatniej synchronizacji (ISO format)
         current_time: Aktualny znacznik czasu (ISO format)
-        
+        force: Jeśli True, traktuje produkt jako całkowicie zmieniony jeśli wystąpi błąd podczas pobierania zmian (domyślnie False)
     Returns:
         Słownik z nazwami zmienionych kolumn i ich wartościami (stara_wartosc -> nowa_wartosc)
     """

@@ -86,7 +86,7 @@ def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None
                     log.error(f"Błąd podczas tworzenia produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
                     status = False
                 else:
-                    log.debug(f"Utworzono produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
+                    log.info(f"Utworzono produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
             all_created.extend(created)
             create_idx += batch_created_count
             
