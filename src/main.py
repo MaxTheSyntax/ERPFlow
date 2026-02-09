@@ -1,153 +1,14 @@
-import time
 import pyodbc
-from woocommerce import API
-from requests.exceptions import HTTPError
 from dotenv import load_dotenv
 import os
 import argparse
 import connections as con
 import logger as log
-import db_sync as sync
+import comarch as db
+import woocommerce as wc
 
 # Zmienne globalne
 args = None
-conn = None
-
-def batch_sync_products(creations: list[dict] = None, updates: list[dict] = None, deletions: list[int] = None) -> tuple[bool, list[dict], list[dict], list[dict]]:
-    """
-    Wysyła batchowe żądania do WooCommerce API dla tworzenia, aktualizacji i usuwania produktów.
-    Wszystkie trzy operacje mogą być wykonane w jednym żądaniu batch.
-    
-    Args:
-        creations: Lista słowników z danymi produktów do utworzenia.
-        updates: Lista słowników z danymi produktów do zaktualizowania (musi zawierać 'id').
-        deletions: Lista ID produktów WooCommerce do usunięcia.
-    
-    Returns:
-        Tuple (success, created_items, updated_items, deleted_items) gdzie:
-        - success: True jeśli wszystkie operacje zakończyły się sukcesem, False w przeciwnym razie
-        - created_items: Lista utworzonych produktów z odpowiedzi API
-        - updated_items: Lista zaktualizowanych produktów z odpowiedzi API
-        - deleted_items: Lista usuniętych produktów z odpowiedzi API
-    """
-    creations = creations or []
-    updates = updates or []
-    deletions = deletions or []
-    
-    if not creations and not updates and not deletions:
-        log.debug("Brak danych do synchronizacji z WooCommerce.")
-        return True, [], [], []
-    
-    batch_size = 100  # WooCommerce ma limit 100 produktów na żądanie
-    status = True
-    all_created = []
-    all_updated = []
-    all_deleted = []
-    
-    total_operations = len(creations) + len(updates) + len(deletions)
-    log.debug(f"Rozpoczynanie operacji w WooCommerce: {len(creations)} utworzeń, {len(updates)} aktualizacji, {len(deletions)} usunięć.")
-    
-    # Indeksy do śledzenia progressu w każdej liście
-    create_idx = 0
-    update_idx = 0
-    delete_idx = 0
-    
-    while create_idx < len(creations) or update_idx < len(updates) or delete_idx < len(deletions):
-        # Budujemy batch
-        data = {}
-        batch_created_count = 0
-        batch_updated_count = 0
-        batch_deleted_count = 0
-        
-        # Dodajemy tworzenia
-        if create_idx < len(creations):
-            remaining = batch_size - (batch_created_count + batch_updated_count + batch_deleted_count)
-            batch = creations[create_idx:create_idx + remaining]
-            if batch:
-                data["create"] = batch
-                batch_created_count = len(batch)
-        
-        # Dodajemy aktualizacje
-        if update_idx < len(updates):
-            remaining = batch_size - (batch_created_count + batch_updated_count + batch_deleted_count)
-            batch = updates[update_idx:update_idx + remaining]
-            if batch:
-                data["update"] = batch
-                batch_updated_count = len(batch)
-        
-        # Dodajemy usunięcia
-        if delete_idx < len(deletions):
-            remaining = batch_size - (batch_created_count + batch_updated_count + batch_deleted_count)
-            batch = deletions[delete_idx:delete_idx + remaining]
-            if batch:
-                data["delete"] = batch
-                batch_deleted_count = len(batch)
-        
-        if not data:
-            break
-        
-        try:
-            response = con.wcapi.post("products/batch", data).json()
-            
-            # Przetwarzamy utworzone produkty
-            created = response.get("create", [])
-            for item in created:
-                if item.get("error"):
-                    log.error(f"Błąd podczas tworzenia produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
-                    status = False
-                else:
-                    log.debug(f"Utworzono produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
-            all_created.extend(created)
-            create_idx += batch_created_count
-            
-            # Przetwarzamy zaktualizowane produkty
-            updated = response.get("update", [])
-            for item in updated:
-                if item.get("error"):
-                    log.error(f"Błąd podczas aktualizacji produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
-                    status = False
-                else:
-                    log.info(f"Zaktualizowano produkt '{item.get('name', 'N/A')}' w WooCommerce (ID: {item.get('id')}).")
-            all_updated.extend(updated)
-            update_idx += batch_updated_count
-            
-            # Przetwarzamy usunięte produkty
-            deleted = response.get("delete", [])
-            for item in deleted:
-                if item.get("error"):
-                    log.error(f"Błąd podczas usuwania produktu (ID: {item.get('id', 'N/A')}): {item.get('error')}")
-                    status = False
-                else:
-                    log.info(f"Usunięto produkt z WooCommerce (ID: {item.get('id')}).")
-            all_deleted.extend(deleted)
-            delete_idx += batch_deleted_count
-            
-            time.sleep(1)  # Krótkie opóźnienie między partiami aby uniknąć limitów API
-            
-        except HTTPError as http_err:
-            log.error(f"Błąd HTTP podczas batchowej synchronizacji produktów: {http_err}")
-            status = False
-            break
-        except Exception as e:
-            log.error(f"Błąd podczas batchowej synchronizacji produktów: {e}")
-            status = False
-            break
-
-    # Wyświetlamy podsumowanie
-    successful_created_count = len([i for i in all_created if not i.get("error")])
-    successful_updated_count = len([i for i in all_updated if not i.get("error")])
-    successful_deleted_count = len([i for i in all_deleted if not i.get("error")])
-    stats = []
-    if creations:
-        stats.append(f"{successful_created_count}/{len(creations)} utworzonych")
-    if updates:
-        stats.append(f"{successful_updated_count}/{len(updates)} zaktualizowanych")
-    if deletions:
-        stats.append(f"{successful_deleted_count}/{len(deletions)} usuniętych")
-    log.debug("Zakończono synchornizacje: " + ", ".join(stats) + " produktów.")
-
-    return status, all_created, all_updated, all_deleted
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -206,7 +67,7 @@ def main():
     con.initialize()
 
     # Wczytanie stanu synchronizacji
-    sync.load_sync_state()
+    db.load_sync_state()
 
     # Konfiguracja bazy danych do śledzenia zmian jeśli flaga jest ustawiona (--setup)
     if args.setup:
@@ -223,7 +84,7 @@ def main():
     
     # Zapisanie zaktualizowanego stanu synchronizacji
     if success: 
-        sync.save_sync_state()
+        db.save_sync_state()
     else:
         log.warning("UWAGA: Synchronizacja zakończyła się z błędami. Mogą istnieć produkty w WooCommerce, które nie są poprawnie zapisane w Comarchu. Sprawdź logi powyżej, aby zidentyfikować problemy.")
 
@@ -262,7 +123,7 @@ def setup():
         # Włączamy temporal tables dla każdej tabeli
         for table in tracked_tables:
             try:
-                if sync.is_temporal_enabled(table):
+                if db.is_temporal_enabled(table):
                     log.debug(f"Temporal table jest już włączone dla tabeli '{table}'.")
                     continue
                     
@@ -321,7 +182,7 @@ def regenerate():
         if wc_ids:
             log.info(f"Znaleziono {len(wc_ids)} produktów do usunięcia z WooCommerce.")
             
-            batch_sync_products(deletions=wc_ids)
+            wc.batch_sync_products(deletions=wc_ids)
             
             # Czyścimy tabelę WoocommerceIDs
             con.cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
@@ -330,8 +191,8 @@ def regenerate():
             log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
         
         # Resetujemy znacznik czasu synchronizacji
-        sync.sync_state = {}
-        sync.save_sync_state()
+        db.sync_state = {}
+        db.save_sync_state()
         log.info("Zresetowano znacznik czasu synchronizacji.")
         
         # Uruchamiamy synchronizację
@@ -358,12 +219,12 @@ def sync_products() -> bool:
     status = True
     
     # Pobieramy aktualny czas przed synchronizacją
-    current_timestamp = sync.get_current_timestamp()
+    current_timestamp = db.get_current_timestamp()
     if current_timestamp is None:
         log.error("Nie udało się pobrać aktualnego czasu z bazy danych. Przerywanie synchronizacji.")
         return False
     
-    last_sync_timestamp = sync.sync_state.get('last_sync_timestamp')
+    last_sync_timestamp = db.sync_state.get('last_sync_timestamp')
     log.debug(f"Ostatnia synchronizacja: {last_sync_timestamp}, aktualny czas: {current_timestamp}")
     
     try:
@@ -373,7 +234,7 @@ def sync_products() -> bool:
         
         # Sprawdź czy temporal tables są włączone jeśli planujemy ich użyć
         if has_previous_sync and not args.full_rebuild:
-            if not sync.is_temporal_enabled('Towary') or not sync.is_temporal_enabled('TwrCeny'):
+            if not db.is_temporal_enabled('Towary') or not db.is_temporal_enabled('TwrCeny'):
                 log.warning("Temporal tables nie są włączone dla tabel Towary/TwrCeny.")
                 log.warning("Uruchom aplikację z flagą --setup, aby skonfigurować bazę danych.")
                 # return False
@@ -436,7 +297,7 @@ def sync_products() -> bool:
         if not products:
             log.info("Brak nowych lub zmienionych produktów do synchronizacji.")
             # Aktualizujemy znacznik czasu nawet gdy nie ma zmian
-            sync.sync_state['last_sync_timestamp'] = current_timestamp
+            db.sync_state['last_sync_timestamp'] = current_timestamp
             return True
 
         # Tworzymy mapowanie Comarch ID -> WooCommerce ID
@@ -460,7 +321,7 @@ def sync_products() -> bool:
                 log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
                 continue
 
-            changes = sync.get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp, force=args.force)
+            changes = db.get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp, force=args.force)
             product_data = {
                 "sku": product.Twr_TwrId
             }
@@ -499,7 +360,7 @@ def sync_products() -> bool:
                 products_to_create.append(product_data)
                 log.debug(f"Przygotowano nowy produkt do utworzenia: {product_data}")
 
-        success, created_items, updated_items, _ = batch_sync_products(
+        success, created_items, updated_items, _ = wc.batch_sync_products(
             creations=products_to_create,
             updates=products_to_update
         )
@@ -532,7 +393,7 @@ def sync_products() -> bool:
         log.info(f"Zakończono synchronizacje produktów. Utworzono {total_created}, zaktualizowano {total_updated} produktów.")
         
         # Aktualizujemy znacznik czasu po udanej synchronizacji
-        sync.sync_state['last_sync_timestamp'] = current_timestamp
+        db.sync_state['last_sync_timestamp'] = current_timestamp
         log.debug(f"Zaktualizowano znacznik czasu synchronizacji: {current_timestamp}")
             
     except Exception as e:
