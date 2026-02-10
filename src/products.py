@@ -5,119 +5,8 @@ import logger as log
 import wc_client as wc
 from args import args
 
-def sync(add_all=None, skip_free=None, force=None) -> bool:
-    """
-    Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
-
-    Returns:
-        bool: True jeśli synchronizacja zakończyła się sukcesem, False w przeciwnym razie.
-    """
-    # Argumenty
-    if args is not None:
-        if add_all is None:
-            add_all = getattr(args, 'full_rebuild', False) or getattr(args, 'regeneruj', False)
-        if skip_free is None:
-            skip_free = not getattr(args, 'obejmuj_darmowe_towary', False)
-        if force is None:
-            force = getattr(args, 'force', False)
-
-    database_name = os.getenv("database_name")
-    if not database_name:
-        log.error("Nie znaleziono nazwy bazy danych w zmiennych środowiskowych.")
-        return False
-
-    status = True
-
-    # Pobieramy aktualny czas przed synchronizacją
-    current_timestamp = db.get_current_timestamp()
-    if current_timestamp is None:
-        log.error("Nie udało się pobrać aktualnego czasu z bazy danych. Przerywanie synchronizacji.")
-        return False
-
-    last_sync_timestamp = db.sync_state.get('last_sync_timestamp')
-    log.debug(f"Ostatnia synchronizacja: {last_sync_timestamp}, aktualny czas: {current_timestamp}")
-
-    try:
-        # Sprawdzamy czy temporal tables są włączone
-        has_previous_sync = last_sync_timestamp is not None
-        use_incremental = has_previous_sync and not add_all
-
-        if use_incremental:
-            if not db.is_temporal_enabled('Towary') or not db.is_temporal_enabled('TwrCeny'):
-                log.warning("Temporal tables nie są włączone dla tabel Towary/TwrCeny.")
-                log.warning("Uruchom aplikację z flagą --setup, aby skonfigurować bazę danych.")
-                log.warning("Przełączam na pełną synchronizację.")
-                use_incremental = False
-
-        # Wywołujemy odpowiedni tryb synchronizacji
-        if use_incremental and isinstance(last_sync_timestamp, str):
-            status = incremental_sync(database_name, last_sync_timestamp, current_timestamp)
-        else:
-            status = full_sync(database_name, current_timestamp)
-
-    except Exception as e:
-        log.error(f"Błąd podczas synchronizacji produktów: {e}", stack_info=True)
-        status = False
-    return status
-
-
-def full_sync(database_name: str, current_timestamp: str, skip_free=None, force=None) -> bool:
-    """
-    Tworzy *(nie usuwa)* wszystkie produkty w WooCommerce na podstawie bazy danych, bez względu na poprzedni stan synchronizacji.
-
-    Args:
-        database_name (str): Nazwa bazy danych.
-        current_timestamp (str): Aktualny znacznik czasu.
-
-    Returns:
-        bool: True jeśli sukces, False w przeciwnym razie.
-    """
-    # Argumenty
-    if args is not None:
-        if skip_free is None:
-            skip_free = not getattr(args, 'obejmuj_darmowe_towary', False)
-        if force is None:
-            force = getattr(args, 'force', False)
-
-    if db.sync_state.get('last_sync_timestamp'):
-        log.info("Pełna przebudowa: pobieranie wszystkich produktów.")
-    else:
-        log.info("Brak poprzedniej synchronizacji. Pobieranie wszystkich produktów.")
-
-    query = f'''
-        SELECT DISTINCT t.Twr_TwrId, Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie 
-        FROM [{database_name}].[CDN].[Towary] t
-        INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
-        WHERE tc.TwC_Typ = 2
-    '''
-    con.cursor.execute(query)
-    products = con.cursor.fetchall()
-
-    return process_and_apply_sync(products, None, current_timestamp)
-
-
-def incremental_sync(database_name: str, last_sync_timestamp: str, current_timestamp: str, skip_free=None, force=None) -> bool:
-    """
-    Wykonuje synchronizację przyrostową (tylko zmienione produkty).
-
-    Args:
-        database_name (str): Nazwa bazy danych.
-        last_sync_timestamp (str): Znacznik czasu ostatniej synchronizacji.
-        current_timestamp (str): Aktualny znacznik czasu.
-
-    Returns:
-        bool: True jeśli sukces, False w przeciwnym razie.
-    """
-    # Argumenty
-    if args is not None:
-        if skip_free is None:
-            skip_free = not getattr(args, 'obejmuj_darmowe_towary', False)
-        if force is None:
-            force = getattr(args, 'force', False)
-
-    log.debug("Wykryto poprzednią synchronizację. Pobieranie zmienionych produktów.")
-
-    query = f'''
+def get_incremental_query(database_name, last_sync_timestamp):
+    return f'''
         SELECT DISTINCT 
             t.Twr_TwrId,
             t.Twr_Nazwa,
@@ -132,7 +21,7 @@ def incremental_sync(database_name: str, last_sync_timestamp: str, current_times
             -- Zmiany w tabeli Towary od ostatniej synchronizacji
             EXISTS (
                 SELECT 1 FROM [{database_name}].[CDN].[Towary] 
-                FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{current_timestamp}' th
+                FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{db.sync_start_timestamp}' th
                 WHERE th.Twr_TwrId = t.Twr_TwrId
                 AND th.ValidFrom > '{last_sync_timestamp}'
             )
@@ -140,30 +29,102 @@ def incremental_sync(database_name: str, last_sync_timestamp: str, current_times
             -- Zmiany w tabeli TwrCeny od ostatniej synchronizacji
             EXISTS (
                 SELECT 1 FROM [{database_name}].[CDN].[TwrCeny] 
-                FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{current_timestamp}' tch
+                FOR SYSTEM_TIME BETWEEN '{last_sync_timestamp}' AND '{db.sync_start_timestamp}' tch
                 WHERE tch.TwC_TwrID = tc.TwC_TwrID
                 AND tch.TwC_Typ = 2
                 AND tch.ValidFrom > '{last_sync_timestamp}'
             )
         )
     '''
-    con.cursor.execute(query)
-    products = con.cursor.fetchall()
 
-    return process_and_apply_sync(products, last_sync_timestamp, current_timestamp)
+def get_full_query(database_name):
+    return f'''
+        SELECT DISTINCT t.Twr_TwrId, Twr_Nazwa, Twr_Opis, TwC_Wartosc, TwC_Zaokraglenie 
+        FROM [{database_name}].[CDN].[Towary] t
+        INNER JOIN [{database_name}].[CDN].[TwrCeny] tc ON t.Twr_TwrId = tc.TwC_TwrID
+        WHERE tc.TwC_Typ = 2
+    '''
 
+def map_product_to_wc(product, last_sync_timestamp, force, skip_free=False):
+    # Obliczamy cenę regularną z uwzględnieniem zaokrągleń
+    regular_price = str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
 
-def process_and_apply_sync(products, last_sync_timestamp, current_timestamp, add_all=None, skip_free=None, force=None) -> bool:
+    # Pomijamy darmowe towary jeśli flaga nie jest ustawiona
+    if float(regular_price) == 0 and skip_free:
+        log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
+        return None
+
+    # Pobieramy szczegółowe zmiany w kolumnach z tabeli Towary
+    towary_changes = db.get_changed_columns(
+        table_name='Towary',
+        columns=['Twr_Nazwa', 'Twr_Opis'],
+        record_id=product.Twr_TwrId,
+        id_column='Twr_TwrId',
+        last_sync=last_sync_timestamp,
+        current_time=db.sync_start_timestamp,
+        force=force
+    )
+    
+    # Pobieramy zmiany w cenie z tabeli TwrCeny
+    ceny_changes = db.get_changed_columns(
+        table_name='TwrCeny',
+        columns=['TwC_Wartosc', 'TwC_Zaokraglenie'],
+        record_id=product.Twr_TwrId,
+        id_column='TwC_TwrID',
+        last_sync=last_sync_timestamp,
+        current_time=db.sync_start_timestamp,
+        force=force
+    )
+    
+    # Obliczamy zmianę ceny jeśli są dane z tabeli TwrCeny
+    price_change = None
+    if ceny_changes:
+        old_wartosc = ceny_changes.get('TwC_Wartosc', {}).get('old')
+        old_zaokraglenie = ceny_changes.get('TwC_Zaokraglenie', {}).get('old')
+        new_wartosc = ceny_changes.get('TwC_Wartosc', {}).get('new')
+        new_zaokraglenie = ceny_changes.get('TwC_Zaokraglenie', {}).get('new')
+        
+        old_price = round(old_wartosc / old_zaokraglenie) * old_zaokraglenie if old_wartosc and old_zaokraglenie else None
+        new_price = round(new_wartosc / new_zaokraglenie) * new_zaokraglenie if new_wartosc and new_zaokraglenie else None
+        
+        if old_price != new_price:
+            price_change = {'old': old_price, 'new': new_price}
+    
+    # Łączymy zmiany
+    changes = towary_changes.copy()
+    if price_change:
+        changes['Cena'] = price_change
+    
+    product_data = {
+        "sku": str(product.Twr_TwrId) # SKU musi być stringiem
+    }
+    
+    if changes:
+        # Jeśli są zmiany, dodajemy tylko zmienione pola
+        if 'Twr_Nazwa' in changes: product_data["name"] = changes['Twr_Nazwa']['new']
+        if 'Twr_Opis' in changes: product_data["description"] = changes['Twr_Opis']['new']
+        if 'Cena' in changes: product_data["regular_price"] = str(changes['Cena']['new'])
+        
+        # Logowanie zmian
+        change_details = ", ".join([
+            f"{col}: {info.get('old')} -> {info.get('new')}"
+            for col, info in changes.items()
+        ])
+        log.debug(f"Zmiany w produkcie ID={product.Twr_TwrId}: {change_details}")
+
+    else:
+        # Jeśli nie ma zmian (np. pełna synchronizacja), używamy aktualnych wartości
+        product_data.update({
+            "name": product.Twr_Nazwa,
+            "description": product.Twr_Opis,
+            "regular_price": regular_price
+        })
+    
+    return product_data
+
+def sync(add_all=None, skip_free=None, force=None) -> bool:
     """
-    Przetwarza listę produktów i wysyła je do WooCommerce.
-
-    Args:
-        products (list): Lista produktów pobrana z bazy.
-        last_sync_timestamp (str): Znacznik czasu ostatniej synchronizacji.
-        current_timestamp (str): Aktualny znacznik czasu.
-
-    Returns:
-        bool: True jeśli sukces, False w przeciwnym razie.
+    Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
     """
     # Argumenty
     if args is not None:
@@ -173,138 +134,67 @@ def process_and_apply_sync(products, last_sync_timestamp, current_timestamp, add
             skip_free = not getattr(args, 'obejmuj_darmowe_towary', False)
         if force is None:
             force = getattr(args, 'force', False)
-    
-    # Sprawdzamy czy jest coś do synchronizacji
-    if not products:
-        log.info("Brak nowych lub zmienionych produktów do synchronizacji.")
-        # Aktualizujemy znacznik czasu nawet gdy nie ma zmian
-        db.sync_state['last_sync_timestamp'] = current_timestamp
-        db.save_sync_state()
-        return True
+            
+    # Domyślne wartości
+    add_all = bool(add_all) if add_all is not None else False
+    skip_free = bool(skip_free) if skip_free is not None else False
+    force = bool(force) if force is not None else False
 
-    # Pobieramy mapowanie Comarch ID -> WooCommerce ID
-    if add_all:
-        wc_id_map = {}
-        log.debug("Pełna przebudowa: reset istniejących mapowań produktów.")
-        con.cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
-    else:
-        con.cursor.execute('SELECT Twr_TwrId, WC_ID FROM [ERPFlow].[WoocommerceIDs]')
-        wc_id_map = {row[0]: row[1] for row in con.cursor.fetchall()}
-        log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań produktów.")
-
-    # Przygotowujemy listy produktów do utworzenia i aktualizacji
-    products_to_create = []
-    products_to_update = []
-
-    for product in products:
-        # Obliczamy cenę regularną z uwzględnieniem zaokrągleń
-        regular_price = str(round(round(product.TwC_Wartosc / product.TwC_Zaokraglenie) * product.TwC_Zaokraglenie, 2))
-
-        # Pomijamy darmowe towary jeśli flaga nie jest ustawiona
-        if float(regular_price) == 0 and skip_free:
-            log.warning(f"Pominięto darmowy produkt '{product.Twr_Nazwa}'. Użyj --obejmuj-darmowe-towary, aby zsynchronizować również darmowe towary.")
-            continue
-
-        # Pobieramy szczegółowe zmiany w kolumnach
-        changes = db.get_changed_columns(product.Twr_TwrId, last_sync_timestamp, current_timestamp, force=force)
-        product_data = {
-            "sku": product.Twr_TwrId
-        }
-        
-        if changes:
-            # Jeśli są zmiany, dodajemy tylko zmienione pola
-            if 'Twr_Nazwa' in changes: product_data["name"] = changes['Twr_Nazwa']['new']
-            if 'Twr_Opis' in changes: product_data["description"] = changes['Twr_Opis']['new']
-            if 'Cena' in changes: product_data["regular_price"] = str(changes['Cena']['new'])
-        else:
-            # Jeśli nie ma zmian (np. pełna synchronizacja), używamy aktualnych wartości
-            product_data.update({
-                "name": product.Twr_Nazwa,
-                "description": product.Twr_Opis,
-                "regular_price": regular_price
-            })
-
-
-        # Sprawdzamy czy produkt już istnieje w WooCommerce
-        if product.Twr_TwrId in wc_id_map:
-            # Produkt istnieje - przygotowujemy do aktualizacji
-            product_data["id"] = wc_id_map[product.Twr_TwrId]
-            products_to_update.append(product_data)
-
-            # Logujemy szczegóły zmian jeśli to synchronizacja przyrostowa
-            if last_sync_timestamp and not add_all:
-                if changes:
-                    change_details = ", ".join([
-                        f"{col}: {info.get('old')} -> {info.get('new')}"
-                        for col, info in changes.items()
-                    ])
-                    log.debug(f"Zmiany w produkcie ID={product.Twr_TwrId}: {change_details}")
-
-            log.debug(f"Przygotowano produkt do aktualizacji: {product_data}")
-        else:
-            # Nowy produkt - przygotowujemy do utworzenia
-            products_to_create.append(product_data)
-            log.debug(f"Przygotowano nowy produkt do utworzenia: {product_data}")
-
-    # Wykonujemy synchronizację batchową
-    success, created_items, updated_items, _ = wc.batch_sync_products(
-        creations=products_to_create,
-        updates=products_to_update
-    )
-    if not success:
+    database_name = os.getenv("database_name")
+    if not database_name:
+        log.error("Nie znaleziono nazwy bazy danych w zmiennych środowiskowych.")
         return False
 
-    # Zapisujemy nowo utworzone mapowania produktów
-    for item in created_items:
-        if item.get("id") and not item.get("error"):
-            comarch_id = item.get("sku")
-            if comarch_id:
-                con.cursor.execute(f'''MERGE [ERPFlow].[WoocommerceIDs] AS target
-                    USING (VALUES ({comarch_id}, {item.get("id")})) AS source (Twr_TwrId, WC_ID)
-                    ON target.Twr_TwrId = source.Twr_TwrId OR target.WC_ID = source.WC_ID
-                    WHEN MATCHED THEN
-                        UPDATE SET Twr_TwrId = source.Twr_TwrId, WC_ID = source.WC_ID
-                    WHEN NOT MATCHED THEN
-                        INSERT (Twr_TwrId, WC_ID) VALUES (source.Twr_TwrId, source.WC_ID);''')
-                log.debug(f"Zmapowano Comarch ID {comarch_id} na WooCommerce ID {item.get('id')}.")
-            else:
-                log.error(f"Nie można znaleźć Comarch ID dla utworzonego produktu WooCommerce ID {item.get('id')}. SKU: {item.get('sku')}")
+    last_sync_timestamp = db.sync_state.get('last_sync_timestamp')
+    has_previous_sync = last_sync_timestamp is not None
+    use_incremental = has_previous_sync and not add_all
 
-    # Zliczamy zaktualizowane produkty
-    total_updated = len([i for i in updated_items if not i.get("error")])
-    total_created = len([i for i in created_items if not i.get("error")])
+    if use_incremental:
+        query = get_incremental_query(database_name, last_sync_timestamp)
+        log.info("Rozpoczynanie synchronizacji przyrostowej produktów...")
+    else:
+        query = get_full_query(database_name)
+        if last_sync_timestamp:
+            log.info("Pełna przebudowa: pobieranie wszystkich produktów.")
+        else:
+            log.info("Brak poprzedniej synchronizacji. Pobieranie wszystkich produktów.")
 
-    log.info(f"Zakończono synchronizacje produktów. Utworzono {total_created}, zaktualizowano {total_updated} produktów.")
+    mapper = lambda row, ls, f: map_product_to_wc(row, ls, f, skip_free=skip_free)
 
-    # Aktualizujemy znacznik czasu po udanej synchronizacji
-    db.sync_state['last_sync_timestamp'] = current_timestamp
-    db.save_sync_state()
-    log.debug(f"Zaktualizowano znacznik czasu synchronizacji: {current_timestamp}")
-    
-    return True
+    return db.generic_sync(
+        entity_name="produktów",
+        fetch_query=query,
+        id_mapping_table="TowarIDs",
+        db_id_column="Twr_TwrId",
+        api_id_column="WC_ID",
+        data_mapper_func=mapper,
+        api_batch_func=wc.batch_sync_products,
+        last_sync_timestamp=last_sync_timestamp,
+        rebuild=add_all,
+        force=force
+    )
 
-def full_rebuild():
+def regenerate():
     """
-    Usuwa wszystkie produkty z WooCommerce, które mają swoje ID w tabeli WoocommerceIDs,
+    Usuwa wszystkie produkty z WooCommerce, które mają swoje ID w tabeli TowarIDs,
     resetuje znacznik czasu synchronizacji i tworzy wszystkie produkty.
     """
     log.info("Rozpoczynanie regeneracji produktów...")
 
     try:
-        # Pobieramy wszystkie ID produktów WooCommerce z tabeli WoocommerceIDs
-        con.cursor.execute('SELECT WC_ID FROM [ERPFlow].[WoocommerceIDs]')
+        # Pobieramy wszystkie ID produktów WooCommerce z tabeli TowarIDs
+        con.cursor.execute('SELECT WC_ID FROM [ERPFlow].[TowarIDs]')
         wc_ids = [row[0] for row in con.cursor.fetchall()]
 
         if wc_ids:
             log.info(f"Znaleziono {len(wc_ids)} produktów do usunięcia z WooCommerce.")
-
             wc.batch_sync_products(deletions=wc_ids)
 
-            # Czyścimy tabelę WoocommerceIDs
-            con.cursor.execute('DELETE FROM [ERPFlow].[WoocommerceIDs]')
-            log.info("Wyczyszczono tabelę WoocommerceIDs.")
+            # Czyścimy tabelę TowarIDs
+            con.cursor.execute('DELETE FROM [ERPFlow].[TowarIDs]')
+            log.info("Wyczyszczono tabelę TowarIDs.")
         else:
-            log.info("Brak produktów do usunięcia w tabeli WoocommerceIDs.")
+            log.info("Brak produktów do usunięcia w tabeli TowarIDs.")
 
         # Resetujemy znacznik czasu synchronizacji
         db.sync_state = {}
@@ -317,6 +207,10 @@ def full_rebuild():
 
         if success:
             log.info("Regeneracja zakończona pomyślnie.")
+            # Aktualizujemy timestamp na teraz
+            if db.sync_start_timestamp:
+                db.sync_state['last_sync_timestamp'] = db.sync_start_timestamp
+                db.save_sync_state()
         else:
             log.error("Regeneracja zakończona z błędami.")
 

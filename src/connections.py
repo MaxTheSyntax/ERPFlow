@@ -55,6 +55,8 @@ def __get_database_connection():
         raise
 
 __wcapi = None
+__wpapi = None
+
 def __get_woocommerce_api():
     """
     Nawiązuje połączenie z WooCommerce API (singleton).
@@ -79,12 +81,43 @@ def __get_woocommerce_api():
         log.error(f"Błąd połączenia z WooCommerce API: {e}")
         raise
 
+def __get_wordpress_api():
+    """
+    Nawiązuje połączenie z WordPress API (singleton).
+    Returns:
+        wordpress_api.API: Obiekt API WordPress.
+    """
+    global __wpapi
+    if __wpapi is not None:
+        return __wpapi
+    try:
+        from wordpress import API
+        __wpapi = API(
+            url=os.getenv("woocommerce_store_url"),
+            consumer_key=os.getenv("woocommerce_consumer_key"),
+            consumer_secret=os.getenv("woocommerce_consumer_secret"),
+            api="wp-json",
+            version="wp/v2",
+            wp_user=os.getenv("wordpress_user"),
+            wp_pass=os.getenv("wordpress_app_password"),
+            basic_auth=True,
+            user_auth=True,
+            timeout=30
+        )
+        log.info("Połączono z WordPress API.")
+        return __wpapi
+    except Exception as e:
+        log.error(f"Błąd połączenia z WordPress API: {e}")
+        raise
+
 def initialize():
-    global cursor, conn, wcapi
+    global cursor, conn, wcapi, wpapi
     load_dotenv()
     cursor, conn = __get_database_connection()
     wcapi = __get_woocommerce_api()
+    wpapi = __get_wordpress_api()
 
 cursor = None
 conn = None
 wcapi = None
+wpapi = None
