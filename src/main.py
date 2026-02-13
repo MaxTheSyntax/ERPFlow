@@ -1,12 +1,13 @@
 import pyodbc
 from dotenv import load_dotenv
 import argparse
-from args import args
+import args as args_lib
 import connections as con
 import logger as log
 import comarch_client as db
 import products
 import contractors
+import discounts
 
 def main():
     parser = argparse.ArgumentParser(
@@ -46,7 +47,7 @@ def main():
         dest="force",
         action="store_true",
         default=False,
-        help="Wymusza traktowanie wszystkich produktów jako zmienionych, nawet jeśli nie można porównać stanu sprzed i po synchronizacji."
+        help="Wymusza traktowanie produktu jako zmieniony, nawet jeśli nie można porównać stanu sprzed i po synchronizacji."
     )
     parser.add_argument(
         "--log-level",
@@ -61,25 +62,33 @@ def main():
         dest="only_products",
         action="store_true",
         default=False,
-        help="Synchronizuj tylko towary, pomijając kontrahentów."
+        help="Synchronizuj tylko towary, pomijając kontrahentów i rabaty."
     )
     parser.add_argument(
         "--tylko-kontrahenci",
         dest="only_contractors",
         action="store_true",
         default=False,
-        help="Synchronizuj tylko kontrahentów, pomijając towary."
+        help="Synchronizuj tylko kontrahentów, pomijając towary i rabaty."
+    )
+    parser.add_argument(
+        "--tylko-rabaty",
+        dest="only_discounts",
+        action="store_true",
+        default=False,
+        help="Synchronizuj tylko rabaty, pomijając towary i kontrahentów."
     )
     
     global args
     args = parser.parse_args()
+    args_lib.args = args
 
     # Ustawienie poziomu logowania
     log.set_log_level(args.log_level)
 
     # Sprawdzenie sprzecznych argumentów
-    if args.only_products and args.only_contractors:
-        log.error("Nie można jednocześnie synchronizować tylko produktów i tylko kontrahentów.")
+    if args.only_products and args.only_contractors and args.only_discounts:
+        log.error("Podano sprzeczne argumenty. Nie można jednocześnie synchronizować tylko produktów i tylko kontrahentów i tylko rabatów.")
         return
 
     # Inicljalizacja połączeń
@@ -107,12 +116,12 @@ def main():
     # Wczytanie stanu synchronizacji
     db.load_sync_state()
 
-    exclusive = args.only_products or args.only_contractors
-
     # Konfiguracja (jeżeli --setup)
     if args.setup:
         setup()
         return
+
+    exclusive = args.only_products or args.only_contractors or args.only_discounts
     
     # Regeneracja - usuwa wszystkie produkty z WooCommerce i synchronizuje ponownie (--regeneruj)
     if args.regeneruj:
@@ -123,15 +132,22 @@ def main():
         return
     
     # Synchronizacja produktów
+    products_success = False
     if not exclusive or args.only_products:
         products_success = products.sync()
     
     # Synchronizacja kontrahentów
+    contractors_success = False
     if not exclusive or args.only_contractors:
         contractors_success = contractors.sync()
+
+    # Synchronizacja rabatów
+    discounts_success = False
+    if not exclusive or args.only_discounts:
+        discounts_success = discounts.sync()
     
     # Zapisanie zaktualizowanego stanu synchronizacji jeżeli synchronizacja zakończyła się sukcesem
-    if (products_success and contractors_success) or (exclusive and (args.only_products or args.only_contractors)): 
+    if (products_success and contractors_success and discounts_success) or (exclusive and (args.only_products or args.only_contractors or args.only_discounts)): 
 
         if db.sync_start_timestamp:
             db.sync_state['last_sync_timestamp'] = db.sync_start_timestamp
@@ -145,7 +161,7 @@ def setup():
     Tworzy schemat ERPFlow, potrzebne tabele oraz włącza temporal tables tam gdzie trzeba.
     """
     # Lista tabel, dla których chcemy włączyć temporal tables
-    tracked_tables = ["Towary", "TwrCeny", "KntOsoby"]
+    tracked_tables = ["Towary", "TwrCeny", "KntOsoby", "Rabaty"]
     
     try:
         # Utworzenie schematu ERPFlow jeśli nie istnieje

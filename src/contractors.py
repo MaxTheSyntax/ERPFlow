@@ -3,7 +3,7 @@ import comarch_client as db
 import connections as con
 import logger as log
 import wp_client as wp
-from args import args
+import args
 
 def get_incremental_query(database_name, last_sync_timestamp):
     return f'''
@@ -95,11 +95,11 @@ def sync(add_all=None, force=None) -> bool:
     Synchronizuje kontrahentów między bazą danych MSSQL a WordPress.
     """
     # Argumenty
-    if args is not None:
+    if args.args is not None:
         if add_all is None:
-            add_all = getattr(args, 'full_rebuild', False) or getattr(args, 'regeneruj', False)
+            add_all = getattr(args.args, 'full_rebuild', False) or getattr(args.args, 'regeneruj', False)
         if force is None:
-            force = getattr(args, 'force', False)
+            force = getattr(args.args, 'force', False)
             
     add_all = bool(add_all) if add_all is not None else False
     force = bool(force) if force is not None else False

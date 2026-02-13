@@ -3,7 +3,7 @@ import comarch_client as db
 import connections as con
 import logger as log
 import wc_client as wc
-from args import args
+import args
 
 def get_incremental_query(database_name, last_sync_timestamp):
     return f'''
@@ -127,13 +127,13 @@ def sync(add_all=None, skip_free=None, force=None) -> bool:
     Synchronizuje produkty między bazą danych MSSQL a WooCommerce.
     """
     # Argumenty
-    if args is not None:
+    if args.args is not None:
         if add_all is None:
-            add_all = getattr(args, 'full_rebuild', False) or getattr(args, 'regeneruj', False)
+            add_all = getattr(args.args, 'full_rebuild', False) or getattr(args.args, 'regeneruj', False)
         if skip_free is None:
-            skip_free = not getattr(args, 'obejmuj_darmowe_towary', False)
+            skip_free = not getattr(args.args, 'obejmuj_darmowe_towary', False)
         if force is None:
-            force = getattr(args, 'force', False)
+            force = getattr(args.args, 'force', False)
             
     # Domyślne wartości
     add_all = bool(add_all) if add_all is not None else False

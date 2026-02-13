@@ -4,7 +4,7 @@ import os
 import pyodbc
 from woocommerce import API
 
-__all__ = ["cursor", "wcapi", "conn"]
+__all__ = ["cursor", "wcapi", "conn", "wpapi", "efapi"]
 
 __conn = None
 __cursor = None
@@ -55,8 +55,6 @@ def __get_database_connection():
         raise
 
 __wcapi = None
-__wpapi = None
-
 def __get_woocommerce_api():
     """
     Nawiązuje połączenie z WooCommerce API (singleton).
@@ -81,6 +79,7 @@ def __get_woocommerce_api():
         log.error(f"Błąd połączenia z WooCommerce API: {e}")
         raise
 
+__wpapi = None
 def __get_wordpress_api():
     """
     Nawiązuje połączenie z WordPress API (singleton).
@@ -110,14 +109,46 @@ def __get_wordpress_api():
         log.error(f"Błąd połączenia z WordPress API: {e}")
         raise
 
+__efapi = None
+def __get_erpflow_api():
+    """
+    Nawiązuje połączenie z ERPFlow WordPress API (singleton).
+    Returns:
+        wordpress_api.API: Obiekt WordPress dla plugina ERPFlow.
+    """
+    global __efapi
+    if __efapi is not None:
+        return __efapi
+    try:
+        from wordpress import API
+        __efapi = API(
+            url=os.getenv("woocommerce_store_url"),
+            consumer_key=os.getenv("woocommerce_consumer_key"),
+            consumer_secret=os.getenv("woocommerce_consumer_secret"),
+            api="wp-json",
+            version="erp-flow/v1",
+            wp_user=os.getenv("wordpress_user"),
+            wp_pass=os.getenv("wordpress_app_password"),
+            basic_auth=True,
+            user_auth=True,
+            timeout=30
+        )
+        log.info("Połączono z ERPFlow WordPress API.")
+        return __efapi
+    except Exception as e:
+        log.error(f"Błąd połączenia z ERPFlow WordPress API: {e}")
+        raise
+
 def initialize():
-    global cursor, conn, wcapi, wpapi
+    global cursor, conn, wcapi, wpapi, efapi
     load_dotenv()
     cursor, conn = __get_database_connection()
     wcapi = __get_woocommerce_api()
     wpapi = __get_wordpress_api()
+    efapi = __get_erpflow_api()
 
 cursor = None
 conn = None
 wcapi = None
 wpapi = None
+efapi = None

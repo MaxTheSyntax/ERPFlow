@@ -137,11 +137,11 @@ def get_changed_columns(table_name: str, columns: list, record_id: int, id_colum
 def generic_sync(
     entity_name: str,
     fetch_query: str,
-    id_mapping_table: str,
-    db_id_column: str,
-    api_id_column: str,
     data_mapper_func,
     api_batch_func,
+    id_mapping_table: str = None,
+    db_id_column: str = None,
+    api_id_column: str = None,
     last_sync_timestamp: str | None = None,
     rebuild: bool = False,
     force: bool = False
@@ -166,9 +166,9 @@ def generic_sync(
         entity_name (str): Nazwa encji czytelna dla człowieka (np. 'produkty', 'kontrahenci')
         fetch_query (str): Zapytanie SQL do pobierania rekordów z bazy danych. Powinno zawierać
             odpowiednie filtrowanie oparte na tabelach temporalnych lub innych mechanizmach wykrywania zmian
-        id_mapping_table (str): Nazwa tabeli przechowującej mapowania ID między bazą danych a API
-        db_id_column (str): Nazwa kolumny w tabeli mapowań dla ID bazy danych (np. 'twi_id')
-        api_id_column (str): Nazwa kolumny w tabeli mapowań dla ID API (np. 'wc_product_id')
+        id_mapping_table (str, optional): Nazwa tabeli przechowującej mapowania ID między bazą danych a API
+        db_id_column (str, optional): Nazwa kolumny w tabeli mapowań dla ID bazy danych (np. 'twi_id')
+        api_id_column (str, optional): Nazwa kolumny w tabeli mapowań dla ID API (np. 'wc_product_id')
         data_mapper_func (callable): Funkcja transformująca wiersz bazy danych do słownika zgodnego z API.
             Sygnatura: (row, last_sync_timestamp, force) -> dict | None
             Powinna zwrócić None, jeśli rekord powinien zostać pominięty
@@ -209,6 +209,7 @@ def generic_sync(
         - Niepowodzenia pojedynczych rekordów nie przerywają całego procesu synchronizacji
     """
     database_name = os.getenv("database_name")
+    status = True
     
     # Wykonanie zapytania
     try:
@@ -224,18 +225,19 @@ def generic_sync(
         return True
 
     # Pobieramy mapowanie ID
-    wc_id_map = {}
-    try:
-        if rebuild:
-            log.debug(f"Pełna przebudowa: reset istniejących mapowań {entity_name}.")
-            con.cursor.execute(f'DELETE FROM [ERPFlow].[{id_mapping_table}]')
-        else:
-            con.cursor.execute(f'SELECT {db_id_column}, {api_id_column} FROM [ERPFlow].[{id_mapping_table}]')
-            wc_id_map = {row[0]: row[1] for row in con.cursor.fetchall()}
-            log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań {entity_name}.")
-    except pyodbc.Error as e:
-        log.error(f"Błąd podczas operacji na tabeli mapowań {id_mapping_table}: {e}")
-        return False
+    if id_mapping_table:
+        wc_id_map = {}
+        try:
+            if rebuild:
+                log.debug(f"Pełna przebudowa: reset istniejących mapowań {entity_name}.")
+                con.cursor.execute(f'DELETE FROM [ERPFlow].[{id_mapping_table}]')
+            else:
+                con.cursor.execute(f'SELECT {db_id_column}, {api_id_column} FROM [ERPFlow].[{id_mapping_table}]')
+                wc_id_map = {row[0]: row[1] for row in con.cursor.fetchall()}
+                log.debug(f"Pobrano {len(wc_id_map)} istniejących mapowań {entity_name}.")
+        except pyodbc.Error as e:
+            log.error(f"Błąd podczas operacji na tabeli mapowań {id_mapping_table}: {e}")
+            return False
 
     # Przygotowujemy listy do API
     to_create = []
@@ -273,7 +275,7 @@ def generic_sync(
 
             item_map[key_value] = db_id
 
-            if db_id in wc_id_map:
+            if id_mapping_table and db_id in wc_id_map:
                 data["id"] = wc_id_map[db_id]
                 to_update.append(data)
                 log.debug(f"Przygotowano {entity_name} do aktualizacji: {db_id} -> {data['id']}")
@@ -282,7 +284,8 @@ def generic_sync(
                 log.debug(f"Przygotowano nowy {entity_name} do utworzenia: {db_id}")
                 
         except Exception as e:
-            log.error(f"Błąd podczas przetwarzania {entity_name} (ID: {getattr(row, db_id_column, 'N/A')}): {e}")
+            log.error(f"Błąd podczas przetwarzania {entity_name} (ID: {getattr(row, db_id_column, 'N/A') if db_id_column else 'N/A'}): {e}")
+            status = False
             continue
 
     if not to_create and not to_update:
@@ -302,43 +305,44 @@ def generic_sync(
 
     # Zapisujemy nowe mapowania
     # Zakładamy, że created_items zawiera pole 'sku' lub 'username' identyfikujące rekord
-    for item in created_items:
-        item_id = item.get("id")
+    if id_mapping_table:
+        for item in created_items:
+            item_id = item.get("id")
+            
+            # Próbujemy znaleźć klucz
+            key = item.get('sku') or item.get('username') or item.get('slug')
         
-        # Próbujemy znaleźć klucz
-        key = item.get('sku') or item.get('username') or item.get('slug')
-        
-        # Jeśli klucz nie jest wprost w odpowiedzi, a api_batch_func zwraca pełne obiekty API,
-        # to może być problem jeśli API nie zwraca wysłanych pól niestandardowych.
-        # W takim przypadku item_map może pomóc jeśli iterujemy w tej samej kolejności, ale batch nie gwarantuje kolejności.
-        
-        # W przypadku WP API create_user zwraca obiekt user z username.
-        # W przypadku WC API create_product zwraca produkt z sku.
-        
-        if not key:
-             # Fallback: jeśli mamy item_map i tylko jeden element utworzony... to słabe.
-             # W wp_client.py musimy upewnić się, że zwracane obiekty mają to co wysłaliśmy jeśli API tego nie zwraca.
-             pass
+            # Jeśli klucz nie jest wprost w odpowiedzi, a api_batch_func zwraca pełne obiekty API,
+            # to może być problem jeśli API nie zwraca wysłanych pól niestandardowych.
+            # W takim przypadku item_map może pomóc jeśli iterujemy w tej samej kolejności, ale batch nie gwarantuje kolejności.
+            
+            # W przypadku WP API create_user zwraca obiekt user z username.
+            # W przypadku WC API create_product zwraca produkt z sku.
+            
+            if not key:
+                # Fallback: jeśli mamy item_map i tylko jeden element utworzony... to słabe.
+                # W wp_client.py musimy upewnić się, że zwracane obiekty mają to co wysłaliśmy jeśli API tego nie zwraca.
+                pass
 
-        if item_id and not item.get("error") and key in item_map:
-            db_id = item_map[key]
-            try:
-                # Merge statement for MSSQL
-                query = f'''MERGE [ERPFlow].[{id_mapping_table}] AS target
-                    USING (VALUES (?, ?)) AS source ({db_id_column}, {api_id_column})
-                    ON target.{db_id_column} = source.{db_id_column} OR target.{api_id_column} = source.{api_id_column}
-                    WHEN MATCHED THEN
-                        UPDATE SET {db_id_column} = source.{db_id_column}, {api_id_column} = source.{api_id_column}
-                    WHEN NOT MATCHED THEN
-                        INSERT ({db_id_column}, {api_id_column}) VALUES (source.{db_id_column}, source.{api_id_column});'''
-                con.cursor.execute(query, (db_id, item_id))
-                log.debug(f"Zmapowano {entity_name} ID {db_id} na API ID {item_id}.")
-            except pyodbc.Error as e:
-                log.error(f"Błąd zapisu mapowania dla {entity_name} ID {db_id}: {e}")
+            if item_id and not item.get("error") and key in item_map:
+                db_id = item_map[key]
+                try:
+                    # Zapytanie MERGE do wstawiania lub aktualizacji mapowania ID w tabeli [ERPFlow].[id_mapping_table]
+                    query = f'''MERGE [ERPFlow].[{id_mapping_table}] AS target
+                        USING (VALUES (?, ?)) AS source ({db_id_column}, {api_id_column})
+                        ON target.{db_id_column} = source.{db_id_column} OR target.{api_id_column} = source.{api_id_column}
+                        WHEN MATCHED THEN
+                            UPDATE SET {db_id_column} = source.{db_id_column}, {api_id_column} = source.{api_id_column}
+                        WHEN NOT MATCHED THEN
+                            INSERT ({db_id_column}, {api_id_column}) VALUES (source.{db_id_column}, source.{api_id_column});'''
+                    con.cursor.execute(query, (db_id, item_id))
+                    log.debug(f"Zmapowano {entity_name} ID {db_id} na API ID {item_id}.")
+                except pyodbc.Error as e:
+                    log.error(f"Błąd zapisu mapowania dla {entity_name} ID {db_id}: {e}")
 
     total_updated = len([i for i in updated_items if not i.get("error")])
     total_created = len([i for i in created_items if not i.get("error")])
 
     log.info(f"Zakończono synchronizacje {entity_name}. Utworzono {total_created}, zaktualizowano {total_updated}.")
     
-    return True
+    return status
